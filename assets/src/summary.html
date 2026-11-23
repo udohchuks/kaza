@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Summary module</title>
+<link rel="stylesheet" href="style.css">
+<style>@page { size: 1080px 960px; }</style>
+</head>
+<body>
+<div id="fig"></div>
+<script src="fig.js"></script>
+<script>
+const W = 1080, H = 960;
+const p = [];
+p.push(header("Summary module", "Training only: squeezes the next 400 ms of our own speech into one of 64 codes."));
+
+// Outputs at the top.
+p.push(box(222, 175, 222, 50, "Target for the summary head", "prior loss, code held fixed", "white", { fs: 14 }));
+p.push(box(465, 175, 230, 50, "Into the depth decoder", "2 values → Linear 2 → 1,024", "teal"));
+p.push(arrow([[450, 290], [450, 255], [333, 255], [333, 227]]));
+p.push(arrow([[450, 255], [580, 255], [580, 227]]));
+p.push(box(350, 290, 200, 46, "Summary code", "1 of 64 · 6 bits", "purple"));
+
+// Module container.
+p.push(container(230, 370, 440, 410, "#dcdcdc", 36));
+p.push(arrow([[450, 395], [450, 338]]));
+p.push(box(340, 395, 220, 32, "FSQ: 8 × 8 levels", null, "amber"));
+p.push(arrow([[450, 455], [450, 429]]));
+p.push(box(350, 455, 200, 32, "Linear 512 → 2", null, "white"));
+p.push(arrow([[450, 515], [450, 489]]));
+p.push(box(350, 515, 200, 32, "Keep only the CLS output", null, "white"));
+p.push(container(275, 565, 350, 110, "#a9a9a9", 28));
+p.push(text(318, 630, "2 ×", { size: 30, weight: 700 }));
+p.push(box(370, 604, 200, 32, "Full attention + SwiGLU", null, "coral"));
+p.push(arrow([[450, 565], [450, 549]]));
+p.push(arrow([[450, 604], [450, 549]], { noHead: true }));
+p.push(arrow([[450, 712], [450, 638]]));
+p.push(box(295, 712, 310, 34, "6 positions × 512 (each frame: sum of 12)", null, "white", { fs: 13 }));
+
+// Inputs.
+const xs = [246, 318, 390, 462, 534, 606];
+const names = [["CLS", "learned"], ["now", "12 tokens"], ["+1", "12 tokens"], ["+2", "12 tokens"], ["+3", "12 tokens"], ["+4", "12 tokens"]];
+xs.forEach((x, i) => {
+  p.push(box(x, 830, 64, 50, names[i][0], names[i][1], i === 0 ? "purple" : "white", { fs: 15 }));
+  p.push(arrow([[x + 32, 830], [x + 32, 805]], { noHead: true }));
+});
+p.push(arrow([[278, 805], [638, 805]], { noHead: true }));
+p.push(arrow([[450, 805], [450, 748]]));
+p.push(text(450, 908, "our own speech · 5 frames · 400 ms", { mono: true, size: 15 }));
+
+// Left labels.
+p.push(label(36, 190, ["Prior loss:", "the summary head", "guesses this code", "from the past only"]));
+p.push(label(36, 405, ["Learns from the", "audio loss through", "the depth decoder", "(straight-through", "FSQ)"]));
+p.push(leader([[200, 411], [337, 411]]));
+p.push(label(36, 610, ["Sees all 5 frames", "at once", "(not causal)"]));
+p.push(leader([[200, 620], [272, 620]]));
+p.push(label(36, 740, ["LFM3-style layers,", "no causal mask", "RMSNorm · SwiGLU", "RoPE · 8 heads"]));
+p.push(leader([[215, 729], [292, 729]]));
+
+// Right: training only note.
+p.push(label(720, 190, ["Training only:", "switched off", "at live use;", "the summary head", "supplies the code"]));
+
+// Right: FSQ worked example.
+p.push(label(720, 380, ["FSQ, worked through"], { size: 22 }));
+p.push(container(715, 400, 330, 395, "#ececec", 24, true));
+p.push(leader([[562, 411], [690, 411], [690, 560], [713, 560]]));
+p.push(text(880, 440, "code = a + 8·b", { size: 20, weight: 600 }));
+p.push(text(880, 470, "2 + 8·2 = code 18", { size: 20, weight: 600, fill: "#666" }));
+const colA = 800, colB = 930;
+for (let lvl = 0; lvl < 8; lvl++) {
+  const y = 700 - lvl * 27;
+  [colA, colB].forEach((cx) => {
+    const on = lvl === 2;
+    p.push(`<rect x="${cx - 24}" y="${y}" width="48" height="23" rx="3" fill="${on ? "#ffb74d" : "#ffffff"}" stroke="#555" stroke-width="1"/>`);
+    p.push(text(cx, y + 16, String(lvl), { size: 12, fill: on ? "#3d2400" : "#888" }));
+  });
+}
+p.push(text(colA, 752, "a = 2", { size: 18, weight: 600 }));
+p.push(text(colB, 752, "b = 2", { size: 18, weight: 600 }));
+p.push(text(880, 778, "each value: one of 8 levels (0 to 7)", { size: 13, fill: "#555" }));
+
+// Right bottom: monitoring.
+p.push(label(720, 850, ["No usage loss:", "code usage is", "monitored every run"]));
+
+draw(W, H, p);
+</script>
+</body>
+</html>

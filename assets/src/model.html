@@ -1,0 +1,161 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Speech-to-speech model</title>
+<link rel="stylesheet" href="style.css">
+<style>@page { size: 1080px 1440px; }</style>
+</head>
+<body>
+<div id="fig"></div>
+<script src="fig.js"></script>
+<script>
+const W = 1080, H = 1440;
+const p = [];
+p.push(header("Speech-to-speech model", "One step per 80 ms frame: listen, plan a summary code, then write the 12 codec tokens."));
+
+// ---- Top: heads and outputs ----
+p.push(text(320, 205, "summary code", { mono: true, size: 15 }));
+p.push(text(545, 205, "12 codec tokens", { mono: true, size: 15 }));
+p.push(arrow([[320, 250], [320, 215]]));
+p.push(arrow([[545, 250], [545, 215]]));
+p.push(box(245, 250, 150, 48, "Summary head", "Linear 2,048 → 64", "purple"));
+p.push(box(470, 250, 150, 48, "Depth decoder", "→ 12 codec tokens", "teal"));
+p.push(arrow([[395, 274], [468, 274]]));
+p.push(text(432, 264, "2 values", { size: 11, fill: "#444" }));
+p.push(box(330, 360, 200, 34, "Context vector (2,048)", null, "white"));
+p.push(arrow([[430, 360], [430, 330], [320, 330], [320, 300]]));
+p.push(arrow([[430, 330], [545, 330], [545, 300]]));
+
+// ---- Backbone ----
+p.push(container(240, 430, 380, 820, "#dcdcdc", 40));
+p.push(text(262, 482, "30 ×", { size: 22, weight: 700, anchor: "start" }));
+p.push(text(262, 508, "Layers", { size: 22, weight: 700, anchor: "start" }));
+p.push(box(360, 465, 140, 32, "Final RMSNorm", null, "white", { fs: 14 }));
+p.push(arrow([[430, 465], [430, 396]]));
+p.push(container(290, 540, 300, 600, "#a9a9a9", 30));
+
+// Blocks from top to bottom: [y, title, style]
+const blocks = [
+  [570, "New ShortConv + FFN", "newlayer"],
+  [618, "ShortConv + FFN", "green"],
+  [666, "Global GQA + FFN", "coral"],
+  [760, "ShortConv + FFN", "green"],
+  [808, "SWA GQA + FFN", "blue"],
+  [856, "New ShortConv + FFN", "newlayer"],
+  [904, "ShortConv + FFN", "green"],
+  [952, "Global GQA + FFN", "coral"],
+  [1040, "ShortConv + FFN", "green"],
+  [1088, "ShortConv + FFN", "green"],
+];
+blocks.forEach(([y, t, s]) => p.push(box(350, y, 160, 28, t, null, s, { fs: 13, r: 6 })));
+for (let i = blocks.length - 1; i > 0; i--) {
+  p.push(arrow([[430, blocks[i][0]], [430, blocks[i - 1][0] + 30]]));
+}
+p.push(arrow([[430, 570], [430, 499]]));
+p.push(text(318, 642, "1 ×", { size: 26, weight: 700 }));
+p.push(text(318, 868, "5 ×", { size: 26, weight: 700 }));
+p.push(text(318, 1082, "1 ×", { size: 26, weight: 700 }));
+p.push(box(312, 1195, 236, 34, "Embedding lookups, summed", null, "white", { fs: 14 }));
+p.push(arrow([[430, 1195], [430, 1118]]));
+
+// ---- Inputs ----
+p.push(box(234, 1310, 126, 50, "User frame", "12 codec tokens", "white", { fs: 14 }));
+p.push(box(367, 1310, 126, 50, "Own last frame", "12 codec tokens", "white", { fs: 14 }));
+p.push(box(500, 1310, 126, 50, "Own last code", "1 of 64 codes", "purple", { fs: 14 }));
+[297, 430, 563].forEach((x) => p.push(arrow([[x, 1310], [x, 1285]], { noHead: true })));
+p.push(arrow([[297, 1285], [563, 1285]], { noHead: true }));
+p.push(arrow([[430, 1285], [430, 1231]]));
+p.push(text(297, 1382, "Phase 1: silence tokens", { size: 12, fill: "#666" }));
+
+// ---- Left labels ----
+p.push(label(30, 215, ["Both go back in", "at the next step"]));
+p.push(label(30, 316, ["Code into the", "depth decoder:", "2 FSQ values (8 × 8);", "in training, the true", "code from the", "summary module"], { size: 17 }));
+p.push(label(30, 488, ["LFM3-1.7B-Base:", "24 original", "layers, frozen"]));
+p.push(label(30, 590, ["New layer:", "copy of the one below,", "output weights = 0,", "trained"], { size: 17 }));
+p.push(leader([[130, 584], [347, 584]]));
+p.push(label(30, 828, ["SWA window:", "256 steps (≈ 20 s)"]));
+p.push(leader([[160, 822], [347, 822]]));
+p.push(label(30, 1205, ["Embedding", ["dimension", "2,048"]]));
+p.push(leader([[185, 1212], [309, 1212]]));
+p.push(label(30, 1330, ["One step", "= one 80 ms frame"]));
+
+// ---- Right: depth decoder panel ----
+p.push(label(690, 222, ["Depth decoder (MaskGIT)"], { size: 22 }));
+p.push(container(690, 238, 360, 222, "#ececec", 24, true));
+for (let i = 0; i < 12; i++) {
+  p.push(`<rect x="${704 + i * 28}" y="256" width="24" height="26" rx="3" fill="#80cbc4" stroke="#1f5c56" stroke-width="0.8"/>`);
+}
+p.push(text(870, 304, "12 token slots, width 1,024", { size: 13 }));
+p.push(text(870, 330, "+ context vector (2,048)", { size: 13, fill: "#444" }));
+p.push(text(870, 350, "+ summary code: 2 values → Linear 2 → 1,024", { size: 13, fill: "#444" }));
+p.push(text(870, 390, "3 bidirectional layers", { size: 17, weight: 600 }));
+p.push(text(870, 416, "inference: 3 passes × 4 tokens", { size: 15, weight: 600, fill: "#666" }));
+p.push(text(870, 440, "training: random tokens hidden", { size: 15, weight: 600, fill: "#666" }));
+p.push(leader([[622, 274], [660, 274], [660, 330], [688, 330]]));
+
+// ---- Right: FFN panel ----
+p.push(label(690, 522, ["FFN (SwiGLU) module"], { size: 22 }));
+p.push(container(690, 538, 360, 252, "#ececec", 24, true));
+p.push(box(810, 556, 120, 28, "Linear out", null, "white", { fs: 13, r: 6 }));
+p.push(circleX(870, 612));
+p.push(box(715, 648, 120, 28, "SiLU", null, "white", { fs: 13, r: 6 }));
+p.push(box(715, 700, 120, 28, "Linear (gate)", null, "white", { fs: 13, r: 6 }));
+p.push(box(905, 700, 120, 28, "Linear (up)", null, "white", { fs: 13, r: 6 }));
+p.push(arrow([[775, 700], [775, 678]]));
+p.push(arrow([[775, 648], [775, 612], [857, 612]]));
+p.push(arrow([[965, 700], [965, 612], [883, 612]]));
+p.push(arrow([[870, 601], [870, 586]]));
+p.push(arrow([[775, 752], [965, 752]], { noHead: true }));
+p.push(arrow([[775, 752], [775, 730]]));
+p.push(arrow([[965, 752], [965, 730]]));
+p.push(arrow([[870, 772], [870, 752]], { noHead: true }));
+p.push(text(900, 776, "input", { size: 12, fill: "#555", anchor: "start" }));
+p.push(label(690, 826, [["Input size:", "2,048"], ["Intermediate size:", "7,680"]]));
+p.push(leader([[512, 918], [650, 918], [650, 680], [688, 680]]));
+
+// ---- Right: GQA panel ----
+p.push(container(690, 880, 360, 232, "#ececec", 24, true));
+p.push(text(870, 904, "GQA + QK-Norm", { size: 15, weight: 600 }));
+p.push(text(870, 924, "sigmoid output gate per head", { size: 15, weight: 600 }));
+p.push(text(870, 944, "partial RoPE in global layers", { size: 15, weight: 600 }));
+p.push(text(870, 964, "16 Q / 4 K/V heads, size 128", { size: 15, weight: 600 }));
+[800, 940].forEach((cx) => {
+  p.push(`<rect x="${cx - 14}" y="985" width="28" height="26" rx="2" fill="#fff4e5" stroke="#e08a00"/>`);
+  p.push(text(cx, 1003, "v", { size: 14, fill: "#b36b00" }));
+  p.push(arrow([[cx, 1011], [cx, 1028]], { noHead: true }));
+  p.push(`<rect x="${cx - 14}" y="1028" width="28" height="26" rx="2" fill="#fdecea" stroke="#c62828"/>`);
+  p.push(text(cx, 1046, "k", { size: 14, fill: "#a11d1d" }));
+  p.push(arrow([[cx, 1054], [cx, 1066]], { noHead: true }));
+  p.push(arrow([[cx - 42, 1066], [cx + 42, 1066]], { noHead: true }));
+  [-42, -14, 14, 42].forEach((dx) => {
+    p.push(arrow([[cx + dx, 1066], [cx + dx, 1078]], { noHead: true }));
+    p.push(`<rect x="${cx + dx - 12}" y="1078" width="24" height="24" rx="2" fill="#eaf3fb" stroke="#1e6bb8"/>`);
+    p.push(text(cx + dx, 1095, "q", { size: 13, fill: "#1e6bb8" }));
+  });
+});
+p.push(text(870, 1134, "2 of the 4 K/V groups shown", { size: 12, fill: "#666" }));
+p.push(leader([[512, 966], [630, 966], [630, 995], [688, 995]]));
+
+// ---- Legend ----
+p.push(label(690, 1190, ["Layer types"], { size: 18 }));
+const legend = [
+  ["green", "ShortConv + FFN (frozen)"],
+  ["coral", "Global GQA + FFN (frozen)"],
+  ["blue", "SWA GQA + FFN (frozen)"],
+  ["newlayer", "New ShortConv + FFN (trained)"],
+  ["purple", "Embeddings, summary head (trained)"],
+  ["teal", "Depth decoder (trained)"],
+];
+legend.forEach(([s, t], i) => {
+  const st = STYLE[s];
+  const y = 1206 + i * 30;
+  const dash = st.dash ? ` stroke-dasharray="${st.dash}"` : "";
+  p.push(`<rect x="692" y="${y}" width="28" height="18" rx="4" fill="${st.fill}" stroke="${st.stroke === "none" ? st.fill : st.stroke}"${dash}/>`);
+  p.push(text(732, y + 14, t, { size: 14, anchor: "start" }));
+});
+
+draw(W, H, p);
+</script>
+</body>
+</html>

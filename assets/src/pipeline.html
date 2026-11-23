@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Training and inference</title>
+<link rel="stylesheet" href="style.css">
+<style>@page { size: 1080px 1060px; }</style>
+</head>
+<body>
+<div id="fig"></div>
+<script src="fig.js"></script>
+<script>
+const W = 1080, H = 1060;
+const p = [];
+p.push(header("Training and inference", "How the parts connect in each mode. Phase 1: the user frame is always silence tokens."));
+
+// Column titles and divider.
+p.push(label(40, 182, ["Training"], { size: 28 }));
+p.push(text(40, 208, "whole clip at once, teacher forcing", { size: 17, weight: 600, fill: "#666", anchor: "start" }));
+p.push(label(560, 182, ["Inference"], { size: 28 }));
+p.push(text(560, 208, "one 80 ms step at a time", { size: 17, weight: 600, fill: "#666", anchor: "start" }));
+p.push(leader([[540, 160], [540, 975]]));
+
+// ================= Training =================
+p.push(box(70, 230, 260, 46, "Audio clips, 24 kHz", null, "white"));
+p.push(arrow([[200, 276], [200, 304]]));
+p.push(box(70, 306, 260, 46, "Codec encoder", "frozen · run once, offline", "frozen"));
+p.push(arrow([[200, 352], [200, 380]]));
+p.push(box(70, 382, 260, 46, "Token files on disk", "12 tokens per 80 ms frame", "white"));
+p.push(arrow([[200, 428], [200, 468]]));
+p.push(arrow([[330, 405], [435, 405], [435, 468]]));
+p.push(box(70, 470, 260, 56, "Inputs for frame t", "user t · ours t−1 · code t−1", "white"));
+p.push(box(350, 470, 170, 56, "Summary module", "true frames t to t+4", "coral"));
+p.push(arrow([[200, 526], [200, 554]]));
+p.push(box(70, 556, 260, 40, "Embed and sum → 2,048", null, "purple"));
+p.push(arrow([[200, 596], [200, 624]]));
+p.push(box(70, 626, 260, 56, "LFM3-1.7B-Base + 6 new", "all frames at once, causal mask", "purple"));
+p.push(arrow([[150, 682], [150, 705], [105, 705], [105, 728]]));
+p.push(arrow([[260, 682], [260, 728]]));
+p.push(arrow([[470, 526], [470, 728]]));
+p.push(text(462, 640, "true code", { size: 12, fill: "#444", anchor: "end" }));
+p.push(text(462, 656, "(2 values)", { size: 12, fill: "#444", anchor: "end" }));
+p.push(box(40, 730, 130, 56, "Summary head", "guesses code t", "purple", { fs: 14 }));
+p.push(box(210, 730, 310, 56, "Depth decoder (MaskGIT)", "context + true code; random tokens hidden", "teal"));
+p.push(arrow([[105, 786], [105, 828]]));
+p.push(arrow([[365, 786], [365, 828]]));
+p.push(box(40, 830, 130, 56, "Prior loss", "vs module code", "coral", { fs: 14 }));
+p.push(box(210, 830, 310, 56, "Audio loss", "vs the true 12 tokens", "coral"));
+p.push(text(40, 925, "Code usage: histogram every run (no usage loss).", { size: 14, fill: "#555", anchor: "start" }));
+p.push(text(40, 947, "Codec decoder: not used in training.", { size: 14, fill: "#555", anchor: "start" }));
+
+// ================= Inference =================
+p.push(box(590, 230, 260, 46, "Microphone", "user speech, live", "white"));
+p.push(arrow([[720, 276], [720, 304]]));
+p.push(box(590, 306, 260, 46, "Streaming codec encoder", "frozen · waits 20 ms look-ahead", "frozen"));
+p.push(arrow([[720, 352], [720, 380]]));
+p.push(box(590, 382, 260, 46, "User tokens", "12 per 80 ms frame", "white"));
+p.push(arrow([[720, 428], [720, 468]]));
+p.push(box(590, 470, 260, 56, "Inputs for step t", "user t · ours t−1 · code t−1", "white"));
+p.push(arrow([[720, 526], [720, 554]]));
+p.push(box(590, 556, 260, 40, "Embed and sum → 2,048", null, "purple"));
+p.push(arrow([[720, 596], [720, 624]]));
+p.push(box(590, 626, 260, 56, "LFM3-1.7B-Base + 6 new", "one step, KV cache for the past", "purple"));
+p.push(arrow([[660, 682], [660, 705], [630, 705], [630, 728]]));
+p.push(arrow([[800, 682], [800, 728]]));
+p.push(box(560, 730, 140, 56, "Summary head", "picks code t", "purple", { fs: 14 }));
+p.push(box(740, 730, 300, 56, "Depth decoder (MaskGIT)", "context + code; 3 passes × 4 tokens", "teal"));
+p.push(arrow([[700, 758], [738, 758]]));
+p.push(text(719, 722, "2 values", { size: 11, fill: "#444" }));
+p.push(arrow([[890, 786], [890, 828]]));
+p.push(box(740, 830, 300, 56, "Codec decoder", "frozen · streaming, holds back 40 ms", "frozen"));
+p.push(arrow([[890, 886], [890, 918]]));
+p.push(box(740, 920, 300, 46, "Speaker", "80 ms of our voice", "white"));
+
+// Feedback to the next step.
+p.push(arrow([[1040, 758], [1058, 758], [1058, 498], [852, 498]], { dash: "6 4", color: "#1f7a71" }));
+p.push(text(955, 490, "our 12 tokens, next step", { size: 12, fill: "#1f7a71" }));
+p.push(arrow([[560, 758], [548, 758], [548, 512], [588, 512]], { dash: "6 4", color: "#6a4fa8" }));
+
+// Legend.
+const legend = [["white", "Data"], ["frozen", "Frozen codec"], ["purple", "Trained"], ["teal", "Depth decoder (trained)"], ["coral", "Training only"]];
+let lx = 70;
+legend.forEach(([s, t]) => {
+  const st = STYLE[s];
+  p.push(`<rect x="${lx}" y="1004" width="26" height="16" rx="4" fill="${st.fill}" stroke="${st.stroke === "none" ? st.fill : st.stroke}"/>`);
+  p.push(text(lx + 34, 1017, t, { size: 14, anchor: "start" }));
+  lx += 34 + t.length * 7.6 + 40;
+});
+p.push(text(860, 1017, "dashed = fed back next step", { size: 14, anchor: "start", fill: "#555" }));
+
+draw(W, H, p);
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=block");
+
+html, body { margin: 0; padding: 0; background: #ffffff; overflow: hidden; }
+svg { display: block; }
+body { font-family: "Inter", "Segoe UI", Arial, sans-serif; }
+svg text { font-family: "Inter", "Segoe UI", Arial, sans-serif; }
+svg .bt { text-anchor: middle; dominant-baseline: central; font-weight: 500; }
+svg .bs { text-anchor: middle; dominant-baseline: central; font-size: 12px; font-weight: 400; }
+svg .mono { font-family: "JetBrains Mono", Consolas, monospace; }
+@page { margin: 0; }
