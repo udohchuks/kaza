@@ -1,6 +1,6 @@
 # Kaza Phase 1: speech continuation
 
-Phase 1 teaches the model to continue speech in African languages from single-speaker audio. Conversation (full-duplex, two speakers) and instruction tuning (SFT or RL) are Phase 2 and are out of scope here. The model architecture is in `project.md`.
+Phase 1 teaches the model to continue speech in African languages. It uses one stream only, the agent stream: each clip is one long piece of audio with every speaker in it. Simulated two streams (Phase 2), real full-duplex conversation and instruction tuning (Phase 3) are out of scope here. The model architecture is in `project.md`.
 
 ## Order of work
 
@@ -13,18 +13,19 @@ Phase 1 teaches the model to continue speech in African languages from single-sp
 
 - Depth decoder: MaskGIT (see `project.md`).
 - Optimizer: AdamW for all trainable parameters. Muon is an ablation for the scaled run, not used in the overfit.
+- User slot in Phase 1: left out (adds 0 to the backbone input; mathematically equivalent to a fixed silence vector and avoids ~0.8 GB of unused user-channel embedding/AdamW memory until Phase 2, when the user stream first appears).
 - No text anywhere, including evaluation: no transcripts and no ASR-based measures.
 
 ## Environment
 
 | Work | Platform | GPU | Precision |
 |---|---|---|---|
-| Overfit test | Free Colab or Kaggle | T4, about 15 to 16 GB (Kaggle gives 2 × T4; we use one) | BF16, emulated in software on the T4 (no BF16 hardware); slower, same numbers as the L4 |
-| Scaled Phase 1 training | Colab Pro | L4, 22.5 GB usable | BF16, native |
+| Overfit test & Scaled Phase 1 | Colab Pro | L4 (22.5 GB) or A100 (40/80 GB) | Native BF16 autocast; frozen backbone in BF16, trainable weights + AdamW states in FP32 |
 
-- Colab does not guarantee the GPU type, so the first notebook cell prints the GPU name, memory and compute capability (BF16 hardware needs 8.0 or higher; the T4 is 7.5).
-- Fallback if a BF16 operation fails on the T4: FP32. Do not use FP16: LFM3 ships in BF16, and BF16-trained models can overflow in FP16.
-- The same code runs on all three platforms. Only the data and output folders differ (Colab: `/content`, Kaggle: `/kaggle/working`).
+- Colab does not guarantee the GPU type, so the first notebook cell prints the GPU name, memory and compute capability (BF16 hardware needs 8.0 or higher; L4 is 8.9, A100 is 8.0).
+- Fallback if a BF16 operation fails: FP32. Do not use FP16: LFM3 ships in BF16, and BF16-trained models can overflow in FP16.
+- Trainable parameters always keep FP32 master weights (so small AdamW updates on zero-init layers do not underflow in BF16).
+- Data and output folders on Colab live under `/content` (`kaza_data` and `kaza_out`).
 - Code: written in this repository, pushed to GitHub, cloned in the notebook.
 - Code is written one part at a time. Each part needs approval before it is written.
 - Software: transformers 5.24.0. It needs Python 3.11 or later and PyTorch 2.6 or later. The first notebook cell prints the Python and PyTorch versions.
@@ -55,22 +56,24 @@ Phase 1 teaches the model to continue speech in African languages from single-sp
 | 45 s | 563 | 6,756 |
 
 - Candidate datasets:
-  - WAXAL (`google/WaxalNLP`): CC-BY-4.0, open download.
-  - NaijaVoices: CC BY-NC-SA 4.0, research use only, gated (register at naijavoices.com). About 600 h each of Hausa, Igbo and Yoruba. Compressed copy is 84 GB.
+  - WAXAL (`google/WaxalNLP`): CC-BY-4.0, open download. Mostly short single-speaker utterances (good for the codec test and short clips).
+  - NaijaVoices: CC BY-NC-SA 4.0 (research / non-commercial only, ShareAlike), gated (register at naijavoices.com). About 600 h each of Hausa, Igbo and Yoruba (84 GB compressed). Mostly short single-speaker utterances.
+  - Long-form / multi-speaker African audio (podcasts, talk radio, conversational corpora): needed for continuous 30–45 s Phase 1 clips without artificial concatenation and required for Phase 2 diarized two-stream simulation.
 
 ## Memory budget (estimate, to be measured in the overfit test)
 
-- Frozen backbone in BF16: about 3.5 GB.
-- 6 new layers (about 370M parameters) with Adam: about 6 GB.
-- Depth decoder and summary module: small.
+- Frozen backbone in BF16: about 3.5 GB (doubles to about 7 GB if T4 falls back to FP32).
+- 6 new Global GQA layers (about 360M parameters) with AdamW: about 5.8 to 6 GB.
+- Trainable agent-channel embeddings (12 tables × 2,016 × 2,048 ≈ 50M params) with AdamW: about 0.8 GB.
+- Depth decoder (~75M params, including 12 output heads) with AdamW: about 1.2 GB.
 - Activations: roughly 1 to 1.5 GB per 45 s example.
-- Total for one 30 s example: about 11 GB, so the overfit fits on a T4.
+- Total for one 30 s example in BF16: about 12.5 to 13 GB (fits on a 15 GB T4). If T4 falls back to FP32, enable gradient checkpointing right away.
 - If memory runs out: gradient checkpointing.
 
 ## Attention reach at 30 to 45 s
 
 - 5 of LFM3's 24 original layers use a sliding window of 256 steps (about 20 s).
-- 6 layers use global attention and see the whole example.
+- 12 layers use global attention and see the whole example (6 frozen original + 6 new trainable Global GQA layers).
 - Anything older than about 20 s reaches the model only through the global layers.
 
 ## Codec test
@@ -111,12 +114,12 @@ Run the checks in order. A check counts only if all checks before it pass.
 | # | Check | Pass when |
 |---|---|---|
 | 1 | Block expansion is an identity at step 0 | Backbone output with the 6 new layers equals plain LFM3 output exactly, before any training |
-| 2 | Loss falls (teacher forcing) | Audio loss and prior loss reach about 0; token accuracy and summary-code accuracy reach 100% |
+| 2 | Loss falls (teacher forcing) | Audio loss reaches about 0 and token accuracy reaches 100% (including at `k = 12`, all tokens masked) |
 | 3 | Frozen weights stay frozen | Checksums of the 24 original layers and the codec are unchanged after training |
-| 4 | Free-running playback | Given the first 1 s, the model generates the rest (summary head + MaskGIT) and the tokens match the clip; decoded audio sounds the same |
-| 5 | Step time | One generation step takes under 80 ms on the L4 (measured on Colab Pro, not on the T4) |
+| 4 | Free-running playback | Given the first 1 s, the model generates the rest (greedy MaskGIT, Gumbel noise off) and the tokens match the clip; decoded audio sounds the same |
+| 5 | Step time | One generation step takes under 80 ms on the L4/A100 (measured on Colab Pro; use `torch.compile` / CUDA graphs if needed) |
 
-Status: proposed, not yet confirmed.
+Status: confirmed.
 
 ## Not needed in Phase 1
 
@@ -125,7 +128,5 @@ Status: proposed, not yet confirmed.
 
 ## Open decisions
 
-1. User slot: each step takes a user frame, but Phase 1 audio has one speaker. Options: a fixed silence token, or leave the user input out.
-2. Overfit checks: confirm the 5 checks above.
-3. Scaled-run evaluation: how to measure Phase 1 quality after scaling. Not yet defined.
-4. Batch size for 30 to 45 s examples on the L4 (set after measuring memory in the overfit test).
+1. Scaled-run evaluation: how to measure Phase 1 quality after scaling. Not yet defined.
+2. Batch size for 30 to 45 s examples on the L4 (set after measuring memory in the overfit test).

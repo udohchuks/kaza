@@ -10,7 +10,7 @@ const STYLE = {
   green: { fill: "#7cb342", stroke: "none", text: "#13280a", sub: "#13280a" },
   blue: { fill: "#4fc3f7", stroke: "none", text: "#062b3d", sub: "#062b3d" },
   amber: { fill: "#ffb74d", stroke: "none", text: "#3d2400", sub: "#5c3600" },
-  newlayer: { fill: "#e3f0d3", stroke: "#1f1f1f", dash: "4 3", text: "#13280a", sub: "#13280a" },
+  newlayer: { fill: "#fce1de", stroke: "#1f1f1f", dash: "4 3", text: "#4a1510", sub: "#6e241c" },
 };
 
 function esc(s) {

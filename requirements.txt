@@ -1,0 +1,9 @@
+# torch and torchaudio are provided by the Colab GPU runtime (do not upgrade mid-session).
+# ECAPA2 (Jenthe/ECAPA2) loads via huggingface_hub as a standalone TorchScript model.
+transformers==5.24.0
+huggingface_hub>=0.28.0
+accelerate>=1.0.0
+soundfile>=0.12.1
+torchmetrics>=1.6.0
+pesq>=0.0.4
+pystoi>=0.4.1
