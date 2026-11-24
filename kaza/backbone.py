@@ -57,12 +57,15 @@ class KazaBackbone(nn.Module):
         frozen_dtype: torch.dtype = torch.bfloat16,
         trainable_dtype: torch.dtype = torch.float32,
         autocast_dtype: torch.dtype = torch.bfloat16,
+        nope_new_layers: bool = True,
     ):
         super().__init__()
         self.device = torch.device(device)
         self.frozen_dtype = frozen_dtype
         self.trainable_dtype = trainable_dtype
         self.autocast_dtype = autocast_dtype
+        self.nope_new_layers = nope_new_layers
+        self.nope_hook_calls = 0
 
         # Load base Lfm3Model directly (skips unused text lm_head)
         base = AutoModel.from_pretrained(model_id, dtype=frozen_dtype)
@@ -102,6 +105,23 @@ class KazaBackbone(nn.Module):
         self.model = base.to(self.device)
         self.config = self.model.config
         self.hidden_size = self.config.hidden_size
+
+        if self.nope_new_layers:
+            self._attach_nope_hooks()
+
+    def _attach_nope_hooks(self) -> None:
+        """Replace position_embeddings=(cos, sin) with (1, 0) on the 6 new Global GQA layers (NoPE)."""
+        def _nope_pre_hook(_module, args, kwargs):
+            pe = kwargs.get("position_embeddings")
+            if pe is not None and isinstance(pe, tuple) and len(pe) == 2:
+                cos, sin = pe
+                kwargs = dict(kwargs)
+                kwargs["position_embeddings"] = (torch.ones_like(cos), torch.zeros_like(sin))
+                self.nope_hook_calls += 1
+            return args, kwargs
+
+        for idx in self.new_layer_indices:
+            self.model.layers[idx].register_forward_pre_hook(_nope_pre_hook, with_kwargs=True)
 
     def set_new_layers_trainable(self, trainable: bool) -> None:
         """Toggle gradients on the 6 new Global GQA layers (off during brief warmup)."""

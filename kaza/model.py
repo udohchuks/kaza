@@ -24,6 +24,7 @@ class KazaModel(nn.Module):
         drop_prob: float = 0.0,
         mtp_offsets: tuple[int, ...] = (),
         mtp_weight: float = 0.0,
+        nope_new_layers: bool = True,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -37,6 +38,7 @@ class KazaModel(nn.Module):
             frozen_dtype=frozen_dtype,
             trainable_dtype=trainable_dtype,
             autocast_dtype=autocast_dtype,
+            nope_new_layers=nope_new_layers,
         )
         d_model = self.backbone.hidden_size
         self.embeddings = KazaInputEmbedding(
