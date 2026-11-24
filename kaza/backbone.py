@@ -164,7 +164,9 @@ def verify_step0_identity(
     backbone.eval()
 
     x = torch.randn(1, seq_len, backbone.hidden_size, device=backbone.device, dtype=backbone.frozen_dtype)
-    y_orig = orig(inputs_embeds=x, use_cache=False).last_hidden_state.float()
+    use_amp = backbone.autocast_dtype != torch.float32 and backbone.device.type == "cuda"
+    with torch.amp.autocast(device_type=backbone.device.type, dtype=backbone.autocast_dtype, enabled=use_amp):
+        y_orig = orig(inputs_embeds=x, use_cache=False).last_hidden_state.float()
     y_exp = backbone(inputs_embeds=x, use_cache=False).last_hidden_state.float()
     max_diff = (y_orig - y_exp).abs().max().item()
 
