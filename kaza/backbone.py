@@ -124,11 +124,16 @@ class KazaBackbone(nn.Module):
         return "\n".join(lines)
 
     def frozen_checksum(self) -> float:
-        """Fast scalar checksum of all frozen parameters (for Check #3)."""
+        """Fast scalar checksum of all original frozen parameters (independent of warmup state)."""
+        new_param_ids = {
+            id(p)
+            for idx in self.new_layer_indices
+            for p in self.model.layers[idx].parameters()
+        }
         total = 0.0
         with torch.no_grad():
             for p in self.model.parameters():
-                if not p.requires_grad:
+                if id(p) not in new_param_ids:
                     total += p.float().abs().sum().item()
         return total
 
