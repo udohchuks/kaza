@@ -184,7 +184,7 @@ def verify_step0_identity(
     """Check #1: compare expanded 30-layer backbone output against original 24-layer LFM3 at step 0.
 
     The new layers output zero at step 0, so this check cannot detect a broken NoPE hook;
-    `preflight_check` counts hook calls for that.
+    `train_phase1` asserts `nope_hook_calls` on the first training step.
     """
     orig = AutoModel.from_pretrained(model_id, dtype=backbone.frozen_dtype).to(backbone.device).eval()
     was_training = backbone.training

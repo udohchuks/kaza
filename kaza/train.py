@@ -399,6 +399,8 @@ def train_phase1(
                 group["lr"] = head_lr if group["name"].startswith("head_") else bb_lr
 
             step_frames = step_rng.choice(cfg.frame_lengths)  # one length per optimizer step
+            if step == start_step + 1:
+                model.backbone.nope_hook_calls = 0
             optimizer.zero_grad(set_to_none=True)
             loss_audio_sum, loss_mtp_sum, acc_sum = 0.0, 0.0, 0.0
 
@@ -411,6 +413,14 @@ def train_phase1(
                 loss_mtp_sum += model.last_losses["mtp"] / cfg.grad_accum
                 acc_sum += acc.item() / cfg.grad_accum
                 frames_since_log += tokens.shape[0] * tokens.shape[1]
+
+            if step == start_step + 1 and model.backbone.nope_new_layers:
+                expected_hooks = len(model.backbone.new_layer_indices) * cfg.grad_accum
+                if model.backbone.nope_hook_calls != expected_hooks:
+                    raise RuntimeError(
+                        f"NoPE hook fired {model.backbone.nope_hook_calls} times on step {step}, "
+                        f"expected {expected_hooks}."
+                    )
 
             grad_norm = float(torch.nn.utils.clip_grad_norm_(all_trainable, cfg.grad_clip).item())
             optimizer.step()
