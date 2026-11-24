@@ -295,87 +295,36 @@ class _MicroBatchSlicer:
         return q.popleft()
 
 
-# ----- preflight -------------------------------------------------------------------------------
-
-
-def preflight_check(
-    model: KazaModel,
-    codec: KazaCodec,
-    train_data: WaxalStreamingDataset,
-    cfg: TrainConfig,
-    timed_batches: int = 5,
-) -> dict[str, float]:
-    """Check NoPE hooks, steady-state streaming speed, and peak VRAM of one full max-length step.
-
-    The VRAM figure includes AdamW state: one optimizer step runs with every LR and weight decay
-    set to 0, so no weight changes.
-    """
-    max_frames = max(cfg.frame_lengths)
-    batches = StreamBatcher(train_data, cfg.batch_size, prefetch=cfg.prefetch_batches)
-    try:
-        t0 = time.perf_counter()
-        wav = next(batches)
-        t_first = time.perf_counter() - t0
-
-        t1 = time.perf_counter()
-        for _ in range(timed_batches):
-            next(batches)
-        t_stream = (time.perf_counter() - t1) / timed_batches
-    finally:
-        batches.close()
-
-    on_cuda = model.device.type == "cuda"
-    if on_cuda:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-    t2 = time.perf_counter()
-    tokens = _encode_exact(codec, wav[:, : max_frames * SAMPLES_PER_FRAME], max_frames)
-    if on_cuda:
-        torch.cuda.synchronize()
-    t_codec = time.perf_counter() - t2
-
-    optimizer, _ = build_optimizer(model, cfg)
-    for group in optimizer.param_groups:
-        group["lr"], group["weight_decay"] = 0.0, 0.0
-
-    model.backbone.nope_hook_calls = 0
-    model.train()
-    t3 = time.perf_counter()
-    loss, _ = model.training_step(tokens)
-    loss.backward()
-    optimizer.step()
-    if on_cuda:
-        torch.cuda.synchronize()
-    t_train = time.perf_counter() - t3
-    hooks_fired = model.backbone.nope_hook_calls
-
-    vram_gb = torch.cuda.max_memory_allocated() / (1024**3) if on_cuda else 0.0
-    optimizer.zero_grad(set_to_none=True)
-    del optimizer
-    if on_cuda:
-        torch.cuda.empty_cache()
-
-    batch_audio_sec = cfg.batch_size * max_frames / FRAME_RATE
-    stream_rt = batch_audio_sec / max(t_stream, 1e-6)
-    gpu_rt = batch_audio_sec / max(t_codec + t_train, 1e-6)
-    expected_hooks = len(model.backbone.new_layer_indices) if model.backbone.nope_new_layers else 0
-
-    print(
-        f"Preflight ({cfg.batch_size} x {max_frames} frames = {batch_audio_sec:.0f}s audio):\n"
-        f"  NoPE hook calls: {hooks_fired} (expected {expected_hooks})\n"
-        f"  Stream: first batch {t_first:.1f}s | steady {t_stream:.2f}s/batch = {stream_rt:.0f}x real time\n"
-        f"  GPU: codec {t_codec * 1000:.0f}ms + fwd/bwd/step {t_train:.2f}s = {gpu_rt:.0f}x real time\n"
-        f"  Peak VRAM incl. AdamW state: {vram_gb:.2f} GB"
-    )
-    if hooks_fired != expected_hooks:
-        raise RuntimeError(f"NoPE hook fired {hooks_fired} times, expected {expected_hooks}.")
-    if stream_rt < gpu_rt:
-        print("  [WARN] Streaming is slower than the GPU step; training will wait on data.")
-    return {"vram_gb": vram_gb, "codec_ms": t_codec * 1000, "stream_rt": stream_rt, "gpu_rt": gpu_rt}
-
-
 # ----- training --------------------------------------------------------------------------------
+
+
+def _open_tb_writer(log_dir: Path):
+    """Open TensorBoard SummaryWriter if available (preinstalled on Colab)."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+
+        return SummaryWriter(log_dir=str(log_dir))
+    except ImportError:
+        return None
+
+
+def _log_tb(writer, record: dict, step: int) -> None:
+    if writer is None:
+        return
+    writer.add_scalar("loss/audio", record["loss_audio"], step)
+    if record.get("loss_mtp", 0.0) > 0.0:
+        writer.add_scalar("loss/mtp", record["loss_mtp"], step)
+    writer.add_scalar("acc/train_masked", record["acc"] * 100.0, step)
+    writer.add_scalar("lr/head", record["lr"], step)
+    writer.add_scalar("lr/backbone", record["bb_lr"], step)
+    writer.add_scalar("health/grad_norm", record["grad_norm"], step)
+    writer.add_scalar("perf/audio_x_rt", record["audio_sec_per_sec"], step)
+    writer.add_scalar("perf/vram_gb", record["vram_gb"], step)
+    if "val_k12_loss" in record:
+        writer.add_scalar("loss/val_k12", record["val_k12_loss"], step)
+        writer.add_scalar("acc/val_k12", record["val_k12_acc"] * 100.0, step)
+        writer.add_scalar("health/active_sources", record["active_sources"], step)
+    writer.flush()
 
 
 def train_phase1(
@@ -432,6 +381,7 @@ def train_phase1(
         )
 
     history: list[dict] = []
+    tb_writer = _open_tb_writer(out_dir / "tb")
     t_log = time.perf_counter()
     frames_since_log = 0
     completed_step = start_step
@@ -507,6 +457,7 @@ def train_phase1(
                 )
                 with open(metrics_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record) + "\n")
+                _log_tb(tb_writer, record, step)
                 history.append(record)
                 t_log = time.perf_counter()
                 frames_since_log = 0
@@ -538,6 +489,8 @@ def train_phase1(
         raise
     finally:
         batches.close()
+        if tb_writer is not None:
+            tb_writer.close()
 
     return history
 
