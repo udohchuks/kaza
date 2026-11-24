@@ -42,11 +42,13 @@ class MaskGITDepthDecoder(nn.Module):
         dropout: float = 0.0,
         num_codebooks: int = NUM_CODEBOOKS,
         vocab_size: int = VOCAB_SIZE,
+        mtp_offsets: tuple[int, ...] = (),
     ):
         super().__init__()
         self.d_model = d_model
         self.num_codebooks = num_codebooks
         self.vocab_size = vocab_size
+        self.mtp_offsets = tuple(mtp_offsets)
 
         self.context_proj = nn.Linear(d_backbone, d_model)
         self.slot_embeds = nn.ModuleList(
@@ -64,6 +66,16 @@ class MaskGITDepthDecoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(d_model)
         self.heads = nn.ModuleList([nn.Linear(d_model, vocab_size) for _ in range(num_codebooks)])
+        self.mtp_projs = nn.ModuleDict(
+            {
+                str(d): nn.Sequential(
+                    nn.Linear(d_backbone, 512),
+                    nn.GELU(),
+                    nn.Linear(512, d_model),
+                )
+                for d in self.mtp_offsets
+            }
+        )
 
     def forward(self, context: torch.Tensor, masked_tokens: torch.Tensor) -> torch.Tensor:
         """Predict logits [..., 12, 2016] from backbone context [..., 2048] and tokens [..., 12]."""
@@ -97,6 +109,36 @@ class MaskGITDepthDecoder(nn.Module):
         loss = F.cross_entropy(masked_logits, masked_targets)
         acc = (masked_logits.argmax(dim=-1) == masked_targets).float().mean()
         return loss, acc
+
+    def compute_mtp_loss(
+        self,
+        context: torch.Tensor,
+        target_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Training-only Multi-Frame Prediction loss on future offsets (e.g. t+2, t+4)."""
+        if not self.mtp_projs:
+            return context.new_zeros(())
+
+        T = target_tokens.shape[1]
+        losses = []
+        for d_str, proj in self.mtp_projs.items():
+            d = int(d_str)
+            if T <= d:
+                continue
+            h = self.norm(proj(context[:, :-d]))  # [B, T-d, d_model]
+            tgt = target_tokens[:, d:]  # [B, T-d, 12]
+            slot_loss = sum(
+                F.cross_entropy(
+                    head(h).reshape(-1, self.vocab_size).float(),
+                    tgt[..., k].reshape(-1),
+                )
+                for k, head in enumerate(self.heads)
+            ) / self.num_codebooks
+            losses.append(slot_loss)
+
+        if not losses:
+            return context.new_zeros(())
+        return sum(losses) / len(losses)
 
     @torch.no_grad()
     def decode(

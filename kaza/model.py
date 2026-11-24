@@ -22,10 +22,14 @@ class KazaModel(nn.Module):
         autocast_dtype: torch.dtype = torch.bfloat16,
         use_user_stream: bool = False,
         drop_prob: float = 0.0,
+        mtp_offsets: tuple[int, ...] = (),
+        mtp_weight: float = 0.0,
     ):
         super().__init__()
         self.device = torch.device(device)
         self.autocast_dtype = autocast_dtype
+        self.mtp_weight = mtp_weight
+        self.last_losses: dict[str, float] = {}
 
         self.backbone = KazaBackbone(
             model_id=backbone_id,
@@ -40,9 +44,10 @@ class KazaModel(nn.Module):
             use_user_stream=use_user_stream,
             drop_prob=drop_prob,
         ).to(device=self.device, dtype=trainable_dtype)
-        self.depth_decoder = MaskGITDepthDecoder(d_backbone=d_model).to(
-            device=self.device, dtype=trainable_dtype
-        )
+        self.depth_decoder = MaskGITDepthDecoder(
+            d_backbone=d_model,
+            mtp_offsets=mtp_offsets,
+        ).to(device=self.device, dtype=trainable_dtype)
 
     def set_warmup(self, enabled: bool) -> None:
         """During warmup, freeze the 6 new backbone layers so only embeddings + depth decoder train."""
@@ -50,6 +55,20 @@ class KazaModel(nn.Module):
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [p for p in self.parameters() if p.requires_grad]
+
+    def trainable_state_dict(self) -> dict[str, torch.Tensor]:
+        """Return only trainable parameters (embeddings + depth decoder + 6 new Global GQA layers)."""
+        new_prefixes = tuple(f"backbone.model.layers.{i}." for i in self.backbone.new_layer_indices)
+        return {
+            k: v.detach().cpu()
+            for k, v in self.state_dict().items()
+            if k.startswith(("embeddings.", "depth_decoder.")) or k.startswith(new_prefixes)
+        }
+
+    def load_trainable_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if unexpected:
+            raise ValueError(f"Unexpected keys in trainable checkpoint: {unexpected[:5]}")
 
     def _autocast(self):
         use_amp = self.autocast_dtype != torch.float32 and self.device.type == "cuda"
@@ -64,12 +83,20 @@ class KazaModel(nn.Module):
         target_tokens: torch.Tensor,
         user_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Teacher-forced forward pass returning (loss, masked_accuracy)."""
+        """Teacher-forced forward pass returning (total_loss, masked_accuracy)."""
         agent_in = shift_agent_tokens(target_tokens)
         with self._autocast():
             x = self.embeddings(agent_in, user_tokens)
             ctx = self.backbone(inputs_embeds=x, use_cache=False).last_hidden_state
-            return self.depth_decoder.compute_loss(ctx, target_tokens, mask_all=False)
+            audio_loss, acc = self.depth_decoder.compute_loss(ctx, target_tokens, mask_all=False)
+            if self.mtp_weight > 0.0 and self.depth_decoder.mtp_projs:
+                mtp_loss = self.depth_decoder.compute_mtp_loss(ctx, target_tokens)
+                total_loss = audio_loss + self.mtp_weight * mtp_loss
+                self.last_losses = {"audio": audio_loss.item(), "mtp": mtp_loss.item()}
+            else:
+                total_loss = audio_loss
+                self.last_losses = {"audio": audio_loss.item(), "mtp": 0.0}
+            return total_loss, acc
 
     @torch.no_grad()
     def eval_all_masked(
