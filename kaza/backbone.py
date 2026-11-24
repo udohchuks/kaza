@@ -108,6 +108,21 @@ class KazaBackbone(nn.Module):
         for idx in self.new_layer_indices:
             self.model.layers[idx].requires_grad_(trainable)
 
+    def summary(self) -> str:
+        """Return a readable 30-layer table showing type, trainable status, dtype, and params."""
+        new_set = set(self.new_layer_indices)
+        lines = [
+            f"KazaBackbone ({self.config.num_hidden_layers} layers, hidden={self.hidden_size})",
+            f"{'Idx':>3}  {'Type':<18}  {'Status':<10}  {'Dtype':<14}  {'Params':>8}",
+            "-" * 61,
+        ]
+        for idx, (layer, ltype) in enumerate(zip(self.model.layers, self.config.layer_types)):
+            p0 = next(layer.parameters())
+            n_m = sum(p.numel() for p in layer.parameters()) / 1e6
+            tag = "NEW (train)" if idx in new_set else "frozen"
+            lines.append(f"{idx:>3}  {ltype:<18}  {tag:<10}  {str(p0.dtype):<14}  {n_m:>6.1f}M")
+        return "\n".join(lines)
+
     def frozen_checksum(self) -> float:
         """Fast scalar checksum of all frozen parameters (for Check #3)."""
         total = 0.0
