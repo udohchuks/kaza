@@ -231,11 +231,14 @@ def preflight_check(
         num_workers=cfg.num_workers,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
+    it = iter(loader)
+    _ = next(it)  # warm up worker startup & HF connection before timing
+
     if model.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
     t0 = time.perf_counter()
-    wav_batch = next(iter(loader))[:, : max_frames * SAMPLES_PER_FRAME]
+    wav_batch = next(it)[:, : max_frames * SAMPLES_PER_FRAME]
     t_stream = time.perf_counter() - t0
 
     t1 = time.perf_counter()

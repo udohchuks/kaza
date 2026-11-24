@@ -1,11 +1,11 @@
-"""WAXAL live HF streaming dataset (same-speaker packing, zero disk) and balanced val cache."""
+"""WAXAL live HF streaming dataset (language-weighted, RAM-bounded, same-speaker packing) & val cache."""
 
 from __future__ import annotations
 
 import io
 import random
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 import soundfile as sf
@@ -26,18 +26,47 @@ IGBO_TRAIN_SOURCES: list[tuple[str, str, str]] = [
 ]
 
 
+def compute_language_weights(
+    sources: list[tuple[str, str, str]],
+    row_counts: list[int],
+    lang_alpha: float = 0.5,
+) -> list[float]:
+    """Weight each language by (total_rows ** lang_alpha), then split proportionally within language.
+
+    Prevents languages with more splits from getting extra weight and stops small TTS splits
+    from repeating at the same rate as large unlabeled ASR splits.
+    """
+    lang_totals: dict[str, int] = defaultdict(int)
+    langs: list[str] = []
+    safe_counts = [max(1, int(c)) for c in row_counts]
+
+    for (_, cfg, _), count in zip(sources, safe_counts):
+        lang = cfg.split("_")[0]
+        langs.append(lang)
+        lang_totals[lang] += count
+
+    raw_weights = [
+        (lang_totals[lang] ** lang_alpha) * (count / lang_totals[lang])
+        for lang, count in zip(langs, safe_counts)
+    ]
+    total_w = sum(raw_weights)
+    return [w / total_w for w in raw_weights]
+
+
 def discover_waxal_sources(
     dataset_id: str = "google/WaxalNLP",
     include_tts: bool = True,
-) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    lang_alpha: float = 0.5,
+) -> tuple[list[tuple[str, str, str]], list[float], list[tuple[str, str, str]]]:
     """Auto-discover all non-duplicate WAXAL configs (`*_asr` + `*_tts`, skipping `*_v2`).
 
-    Routes `train` + `unlabeled` splits -> train_sources, `validation` -> val_sources.
+    Returns `(train_sources, train_weights, val_sources)` using metadata-only row counts.
     """
-    from datasets import get_dataset_config_names, get_dataset_split_names
+    from datasets import get_dataset_config_names, get_dataset_split_names, load_dataset_builder
 
     configs = sorted(get_dataset_config_names(dataset_id))
     train_sources: list[tuple[str, str, str]] = []
+    train_counts: list[int] = []
     val_sources: list[tuple[str, str, str]] = []
 
     for cfg in configs:
@@ -45,24 +74,38 @@ def discover_waxal_sources(
             continue
         if not include_tts and cfg.endswith("_tts"):
             continue
-        try:
-            splits = set(get_dataset_split_names(dataset_id, cfg))
-        except Exception as e:
-            print(f"  [WARN] Could not list splits for {cfg}: {e}")
-            continue
 
-        if "train" in splits:
-            train_sources.append((dataset_id, cfg, "train"))
-        if "unlabeled" in splits:
-            train_sources.append((dataset_id, cfg, "unlabeled"))
-        if "validation" in splits:
+        split_counts: dict[str, int] = {}
+        try:
+            builder = load_dataset_builder(dataset_id, cfg)
+            if builder.info.splits:
+                for sname, sinfo in builder.info.splits.items():
+                    split_counts[sname] = max(1, int(sinfo.num_examples or 1))
+        except Exception:
+            pass
+
+        if not split_counts:
+            try:
+                for sname in get_dataset_split_names(dataset_id, cfg):
+                    split_counts[sname] = 1
+            except Exception as e:
+                print(f"  [WARN] Could not list splits for {cfg}: {e}")
+                continue
+
+        for sname in ("train", "unlabeled"):
+            if sname in split_counts:
+                train_sources.append((dataset_id, cfg, sname))
+                train_counts.append(split_counts[sname])
+        if "validation" in split_counts:
             val_sources.append((dataset_id, cfg, "validation"))
 
+    train_weights = compute_language_weights(train_sources, train_counts, lang_alpha=lang_alpha)
+    n_langs = len({cfg.split("_")[0] for _, cfg, _ in train_sources})
     print(
-        f"Discovered {dataset_id}: {len(train_sources)} train splits, "
-        f"{len(val_sources)} validation splits across {len(configs)} configs."
+        f"Discovered {dataset_id}: {len(train_sources)} train splits ({n_langs} languages, "
+        f"alpha={lang_alpha}), {len(val_sources)} validation splits."
     )
-    return train_sources, val_sources
+    return train_sources, train_weights, val_sources
 
 
 def _decode_row_audio(row: dict) -> torch.Tensor | None:
@@ -88,7 +131,6 @@ def _row_speaker_id(row: dict, config: str) -> str | None:
         s = str(spk).strip()
         if s and s.lower() not in ("none", "nan", "unknown"):
             return s
-    # TTS configs are single-speaker even if speaker_id column is absent
     if config.endswith("_tts"):
         return f"tts_{config}"
     return None
@@ -97,19 +139,19 @@ def _row_speaker_id(row: dict, config: str) -> str | None:
 class WaxalStreamingDataset(IterableDataset):
     """Live HF streaming dataset packing same-language & same-speaker clips into exact frames.
 
-    - Uses exact frame counts: `clip_samples = clip_frames * SAMPLES_PER_FRAME (1920)`.
-    - Keeps up to `max_speakers` (default 64) active speaker buckets per language stream;
-      clips without `speaker_id` or evicted oldest buckets flush into a same-language
-      fallback bucket so zero audio is wasted and RAM stays bounded.
-    - Designed for multi-worker `DataLoader` (each worker gets its own shard of sources).
+    - Exact frame counts: `clip_samples = clip_frames * SAMPLES_PER_FRAME (1920)`.
+    - Language-weighted sampling (`source_weights` from `rows^0.5` per language, proportional per split).
+    - Hard per-worker RAM cap (`max_worker_mb`, default 256 MB) + `max_speakers=8` per source.
     """
 
     def __init__(
         self,
         sources: list[tuple[str, str, str]],
+        source_weights: list[float] | None = None,
         clip_frames: int = 750,  # 60.0s; exact multiple of 250 (20s), 375 (30s), 750 (60s)
         gap_sec: float = 0.3,
-        max_speakers: int = 64,
+        max_speakers: int = 8,
+        max_worker_mb: float = 256.0,
         seed: int = 42,
         max_retries: int = 5,
     ):
@@ -117,10 +159,17 @@ class WaxalStreamingDataset(IterableDataset):
         if not sources:
             raise ValueError("WaxalStreamingDataset requires at least one source.")
         self.sources = list(sources)
+        if source_weights is not None:
+            if len(source_weights) != len(sources):
+                raise ValueError("source_weights must match length of sources.")
+            self.source_weights = list(source_weights)
+        else:
+            self.source_weights = [1.0 / len(sources)] * len(sources)
         self.clip_frames = clip_frames
         self.clip_samples = clip_frames * SAMPLES_PER_FRAME
         self.gap_samples = int(round(gap_sec * SAMPLE_RATE))
         self.max_speakers = max_speakers
+        self.max_worker_samples = int((max_worker_mb * 1024 * 1024) // 4)  # float32 = 4 bytes
         self.seed = seed
         self.max_retries = max_retries
 
@@ -149,18 +198,41 @@ class WaxalStreamingDataset(IterableDataset):
             return clip, [rem], len(rem)
         return clip, [], 0
 
-    def _next_clip_from_source(self, state: dict) -> torch.Tensor | None:
+    def _enforce_worker_ram_cap(self, states: list[dict]) -> None:
+        """Evict oldest speaker buckets across all sources if worker buffer exceeds max_worker_mb."""
+        total = sum(s["spk_samples"] + s["mixed_len"] for s in states)
+        while total > self.max_worker_samples:
+            # Pick the source holding the most speaker-bucket samples
+            candidates = [s for s in states if s["spk_bufs"]]
+            if not candidates:
+                break
+            victim = max(candidates, key=lambda s: s["spk_samples"])
+            _, (old_buf, old_len) = victim["spk_bufs"].popitem(last=False)
+            victim["spk_samples"] -= old_len
+            if old_buf:
+                added = self._append_to_bucket(victim["mixed_buf"], torch.cat(old_buf))
+                victim["mixed_len"] += added
+                total = total - old_len + added
+            else:
+                total -= old_len
+            # If moving to mixed didn't reduce total (just moved bytes), drop oldest mixed tail if still over cap
+            if total > self.max_worker_samples and victim["mixed_len"] > self.clip_samples * 2:
+                cat = torch.cat(victim["mixed_buf"])
+                keep = cat[-self.clip_samples :]
+                dropped = len(cat) - len(keep)
+                victim["mixed_buf"] = [keep]
+                victim["mixed_len"] = len(keep)
+                total -= dropped
+
+    def _next_clip_from_source(self, state: dict, all_states: list[dict]) -> torch.Tensor | None:
         """Pull utterances from one language stream until a speaker (or fallback) bucket fills."""
         spk_bufs: OrderedDict[str, tuple[list[torch.Tensor], int]] = state["spk_bufs"]
-        mixed_buf: list[torch.Tensor] = state["mixed_buf"]
-        mixed_len: int = state["mixed_len"]
         retries = 0
 
         while True:
-            # First check if fallback bucket already has a full clip ready
-            if mixed_len >= self.clip_samples:
-                clip, mixed_buf, mixed_len = self._pop_clip_from_bucket(mixed_buf)
-                state["mixed_buf"], state["mixed_len"] = mixed_buf, mixed_len
+            if state["mixed_len"] >= self.clip_samples:
+                clip, mbuf, mlen = self._pop_clip_from_bucket(state["mixed_buf"])
+                state["mixed_buf"], state["mixed_len"] = mbuf, mlen
                 return clip
 
             if state["iter"] is None:
@@ -175,7 +247,7 @@ class WaxalStreamingDataset(IterableDataset):
                 except Exception as e:
                     retries += 1
                     if retries > self.max_retries:
-                        print(f"  [WARN] Skipping {state['config']}/{state['split']}: {e}")
+                        print(f"  [WARN] Open failed for {state['config']}/{state['split']}: {e}")
                         return None
                     time.sleep(min(2**retries, 16))
                     continue
@@ -204,15 +276,15 @@ class WaxalStreamingDataset(IterableDataset):
 
             spk = _row_speaker_id(row, state["config"])
             if spk is None:
-                mixed_len += self._append_to_bucket(mixed_buf, w)
-                state["mixed_buf"], state["mixed_len"] = mixed_buf, mixed_len
-                if mixed_len >= self.clip_samples:
-                    clip, mixed_buf, mixed_len = self._pop_clip_from_bucket(mixed_buf)
-                    state["mixed_buf"], state["mixed_len"] = mixed_buf, mixed_len
+                state["mixed_len"] += self._append_to_bucket(state["mixed_buf"], w)
+                if state["mixed_len"] >= self.clip_samples:
+                    clip, mbuf, mlen = self._pop_clip_from_bucket(state["mixed_buf"])
+                    state["mixed_buf"], state["mixed_len"] = mbuf, mlen
                     return clip
             else:
                 if spk in spk_bufs:
                     buf, blen = spk_bufs.pop(spk)
+                    state["spk_samples"] -= blen
                 else:
                     buf, blen = [], 0
                 blen += self._append_to_bucket(buf, w)
@@ -221,45 +293,58 @@ class WaxalStreamingDataset(IterableDataset):
                     clip, rem_buf, rem_len = self._pop_clip_from_bucket(buf)
                     if rem_len > 0:
                         spk_bufs[spk] = (rem_buf, rem_len)
+                        state["spk_samples"] += rem_len
                     return clip
 
                 spk_bufs[spk] = (buf, blen)
-                # Evict oldest unfinished speaker bucket into same-language fallback
+                state["spk_samples"] += blen
                 while len(spk_bufs) > self.max_speakers:
-                    _, (old_buf, _) = spk_bufs.popitem(last=False)
+                    _, (old_buf, old_len) = spk_bufs.popitem(last=False)
+                    state["spk_samples"] -= old_len
                     if old_buf:
-                        mixed_len += self._append_to_bucket(mixed_buf, torch.cat(old_buf))
-                        state["mixed_buf"], state["mixed_len"] = mixed_buf, mixed_len
+                        state["mixed_len"] += self._append_to_bucket(
+                            state["mixed_buf"], torch.cat(old_buf)
+                        )
+                self._enforce_worker_ram_cap(all_states)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         rng = random.Random(self.seed + worker_id * 9973)
 
+        paired = list(zip(self.sources, self.source_weights))
         if worker_info is not None and worker_info.num_workers > 1:
-            my_sources = self.sources[worker_id :: worker_info.num_workers] or self.sources
+            my_paired = paired[worker_id :: worker_info.num_workers] or paired
         else:
-            my_sources = self.sources
+            my_paired = paired
 
+        initial_count = len(my_paired)
         states = [
             {
                 "dataset_id": d,
                 "config": c,
                 "split": s,
+                "weight": w,
                 "iter": None,
                 "epoch": worker_id,
                 "spk_bufs": OrderedDict(),
+                "spk_samples": 0,
                 "mixed_buf": [],
                 "mixed_len": 0,
             }
-            for d, c, s in my_sources
+            for (d, c, s), w in my_paired
         ]
 
         while states:
-            idx = rng.randrange(len(states))
-            clip = self._next_clip_from_source(states[idx])
+            weights = [s["weight"] for s in states]
+            idx = rng.choices(range(len(states)), weights=weights, k=1)[0]
+            clip = self._next_clip_from_source(states[idx], states)
             if clip is None:
-                states.pop(idx)
+                dropped = states.pop(idx)
+                print(
+                    f"[ALERT] Worker {worker_id} dropped {dropped['config']}/{dropped['split']} "
+                    f"— {len(states)}/{initial_count} active sources remaining."
+                )
                 continue
             yield clip
 
@@ -288,7 +373,6 @@ def build_token_cache(
 
     max_samples = int(max_hours * 3600 * SAMPLE_RATE)
     chunk_samples = encode_chunk_frames * SAMPLES_PER_FRAME
-    # Cap each source evenly so a 0.5h validation cache covers all ~19-21 WAXAL languages
     per_source_cap = max(chunk_samples, max_samples // max(1, len(sources)))
     gap_samples = int(round(gap_sec * SAMPLE_RATE))
 
