@@ -15,8 +15,6 @@ import torch.nn.functional as F
 class RuntimeEnv:
     platform: str
     root_dir: Path
-    data_dir: Path
-    out_dir: Path
     device: torch.device
     frozen_dtype: torch.dtype
     trainable_dtype: torch.dtype
@@ -26,11 +24,6 @@ class RuntimeEnv:
     compute_capability: tuple[int, int] | None
     bf16_hardware: bool
     bf16_supported: bool
-
-    @property
-    def dtype(self) -> torch.dtype:
-        """Backwards-compatible alias for frozen/autocast dtype."""
-        return self.autocast_dtype
 
 
 def detect_platform() -> tuple[str, Path]:
@@ -64,14 +57,13 @@ def _test_bf16_ops(device: torch.device) -> bool:
             and x.grad is not None
             and torch.isfinite(x.grad).all().item()
         )
-    except Exception:
+    except Exception as e:
+        print(f"BF16 op test failed ({type(e).__name__}: {e}); falling back to FP32.")
         return False
 
 
 def get_runtime_env(prefer_bf16: bool = True) -> RuntimeEnv:
     platform, root_dir = detect_platform()
-    data_dir = root_dir / "kaza_data"
-    out_dir = root_dir / "kaza_out"
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -100,8 +92,6 @@ def get_runtime_env(prefer_bf16: bool = True) -> RuntimeEnv:
     return RuntimeEnv(
         platform=platform,
         root_dir=root_dir,
-        data_dir=data_dir,
-        out_dir=out_dir,
         device=device,
         frozen_dtype=frozen_dtype,
         trainable_dtype=trainable_dtype,

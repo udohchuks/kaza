@@ -25,7 +25,7 @@ Phase 1 teaches the model to continue speech in African languages. It uses one s
 - Colab does not guarantee the GPU type, so the first notebook cell prints the GPU name, memory and compute capability (BF16 hardware needs 8.0 or higher; L4 is 8.9, A100 is 8.0).
 - Fallback if a BF16 operation fails: FP32. Do not use FP16: LFM3 ships in BF16, and BF16-trained models can overflow in FP16.
 - Trainable parameters always keep FP32 master weights (so small AdamW updates on zero-init layers do not underflow in BF16).
-- Data and output folders on Colab live under `/content` (`kaza_data` and `kaza_out`).
+- Runs, checkpoints and the validation token cache live on Google Drive under `kaza_phase1/`.
 - Code: written in this repository, pushed to GitHub, cloned in the notebook.
 - Code is written one part at a time. Each part needs approval before it is written.
 - Software: transformers 5.24.0. It needs Python 3.11 or later and PyTorch 2.6 or later. The first notebook cell prints the Python and PyTorch versions.
@@ -47,7 +47,7 @@ Phase 1 teaches the model to continue speech in African languages. It uses one s
 
 - Audio: 24 kHz, mono, samples in [-1, 1].
 - Encode each recording in **one** codec call, start to end. Do not cut a recording before encoding: a cut makes the tokens near the cut differ from continuous encoding.
-- Store 12 tokens per 80 ms frame on disk. Training reads tokens only. The codec does not run during training.
+- Training audio streams from Hugging Face and the frozen codec encodes it on the GPU during training. Only the small validation set is stored on disk as tokens (12 per 80 ms frame).
 - Training example length: 30 to 45 s.
 
 | Example length | Frames (steps) | Tokens per example |
@@ -86,8 +86,8 @@ Method: encode each clip to tokens, decode back to audio, compare the reconstruc
 |---|---|---|
 | Listening | Whether it sounds right | Play original and reconstruction side by side |
 | Mel distance (lower is better) | How far apart the two spectrograms are | PyTorch |
-| PESQ, wideband (about 1 to 4.5) | Perceived quality | `torchmetrics`, audio resampled to 16 kHz |
-| STOI (0 to 1) | Intelligibility | `torchmetrics` |
+| PESQ, wideband (about 1 to 4.5) | Perceived quality | `pesq`, audio resampled to 16 kHz |
+| STOI (0 to 1) | Intelligibility | `pystoi`, audio resampled to 16 kHz |
 | Speaker similarity (cosine, about 0 to 1) | Same voice before and after | ECAPA speaker-embedding model |
 
 Steps:

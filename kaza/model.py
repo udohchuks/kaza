@@ -68,7 +68,13 @@ class KazaModel(nn.Module):
         }
 
     def load_trainable_state_dict(self, state: dict[str, torch.Tensor]) -> None:
-        missing, unexpected = self.load_state_dict(state, strict=False)
+        """Load a `trainable_state_dict` checkpoint; raise if any trainable key is missing or extra."""
+        missing_trainable = sorted(set(self.trainable_state_dict()) - set(state))
+        if missing_trainable:
+            raise ValueError(
+                f"Checkpoint lacks {len(missing_trainable)} trainable keys: {missing_trainable[:5]}"
+            )
+        _, unexpected = self.load_state_dict(state, strict=False)
         if unexpected:
             raise ValueError(f"Unexpected keys in trainable checkpoint: {unexpected[:5]}")
 

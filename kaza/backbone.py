@@ -62,7 +62,6 @@ class KazaBackbone(nn.Module):
         super().__init__()
         self.device = torch.device(device)
         self.frozen_dtype = frozen_dtype
-        self.trainable_dtype = trainable_dtype
         self.autocast_dtype = autocast_dtype
         self.nope_new_layers = nope_new_layers
         self.nope_hook_calls = 0
@@ -160,7 +159,6 @@ class KazaBackbone(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool = False,
     ):
@@ -172,7 +170,6 @@ class KazaBackbone(nn.Module):
         ):
             return self.model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
             )
@@ -184,8 +181,13 @@ def verify_step0_identity(
     model_id: str = MODEL_ID,
     seq_len: int = 8,
 ) -> float:
-    """Check #1: compare expanded 30-layer backbone output against original 24-layer LFM3 at step 0."""
+    """Check #1: compare expanded 30-layer backbone output against original 24-layer LFM3 at step 0.
+
+    The new layers output zero at step 0, so this check cannot detect a broken NoPE hook;
+    `preflight_check` counts hook calls for that.
+    """
     orig = AutoModel.from_pretrained(model_id, dtype=backbone.frozen_dtype).to(backbone.device).eval()
+    was_training = backbone.training
     backbone.eval()
 
     x = torch.randn(1, seq_len, backbone.hidden_size, device=backbone.device, dtype=backbone.frozen_dtype)
@@ -196,6 +198,7 @@ def verify_step0_identity(
     max_diff = (y_orig - y_exp).abs().max().item()
 
     del orig
+    backbone.train(was_training)
     if backbone.device.type == "cuda":
         torch.cuda.empty_cache()
     return max_diff

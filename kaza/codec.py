@@ -13,8 +13,6 @@ MODEL_ID = "LiquidAI/Liquid-Codec"
 SAMPLE_RATE = 24_000
 FRAME_RATE = 12.5
 SAMPLES_PER_FRAME = 1920
-NUM_CODEBOOKS = 12
-VOCAB_SIZE = 2016
 
 
 def to_mono_24k(wav: np.ndarray | torch.Tensor, sr: int, target_sr: int = SAMPLE_RATE) -> torch.Tensor:
@@ -55,7 +53,7 @@ class KazaCodec:
     def encode(self, wav_24k: torch.Tensor) -> torch.Tensor:
         """Encode 24 kHz mono audio [T_samples] or [B, T_samples] -> tokens [B, T, 12] (long)."""
         x = wav_24k.unsqueeze(0) if wav_24k.ndim == 1 else wav_24k
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype).contiguous()
         codes = self.model.encode(x).audio_codes  # [B, 12, T]
         return codes.transpose(1, 2).contiguous().long()  # [B, T, 12]
 

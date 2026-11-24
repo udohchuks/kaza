@@ -1,8 +1,7 @@
-"""Phase 1 training loop: live HF streaming, 2-group LR + no-decay, Drive checkpoints, monitoring."""
+"""Phase 1 training: live WAXAL streaming, 4-group AdamW (head/backbone x decay/no-decay), Drive checkpoints."""
 
 from __future__ import annotations
 
-import inspect
 import json
 import math
 import random
@@ -14,30 +13,49 @@ from pathlib import Path
 import soundfile as sf
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 
 from kaza.codec import FRAME_RATE, SAMPLE_RATE, SAMPLES_PER_FRAME, KazaCodec
-from kaza.data import TokenChunkDataset
+from kaza.data import StreamBatcher, TokenChunkDataset, WaxalStreamingDataset
 from kaza.model import KazaModel
+
+ADAM_BETAS = (0.9, 0.95)
+DECAY_GROUPS = ("head_decay", "bb_decay")
+
+# Config fields that must match when resuming a run
+RESUME_CRITICAL_FIELDS = (
+    "frame_lengths",
+    "batch_size",
+    "grad_accum",
+    "max_steps",
+    "warmup_freeze_steps",
+    "lr_warmup_steps",
+    "backbone_warmup_steps",
+    "lr",
+    "min_lr",
+    "backbone_lr",
+    "min_backbone_lr",
+    "weight_decay",
+)
 
 
 @dataclass
 class TrainConfig:
     out_dir: str = "/content/drive/MyDrive/kaza_phase1/runs/waxal_nope_v1"
-    frame_lengths: tuple[int, ...] = (250, 375, 750)  # 20s, 30s, 60s (exact divisors of 750)
+    frame_lengths: tuple[int, ...] = (250, 375, 750)  # 20s, 30s, 60s (each divides 750)
     val_seq_len: int = 375  # 30.0s fixed validation windows
     batch_size: int = 4  # A100-40GB: 4 (safe up to 60s) | A100-80GB: 8 | L4: 2
-    grad_accum: int = 8  # effective batch = 32 clips (~21 min audio / step)
-    num_workers: int = 2  # CPU workers prefetching HF audio + soundfile + resample_poly
+    grad_accum: int = 8  # effective batch = 32 clips
+    prefetch_batches: int = 4  # streamed batches kept ready by the background thread
     max_steps: int = 5000
     warmup_freeze_steps: int = 200  # embeddings + depth decoder only before unfreezing 6 new layers
     lr_warmup_steps: int = 100
-    backbone_warmup_steps: int = 100  # gentle 0 -> backbone_lr ramp after unfreezing
+    backbone_warmup_steps: int = 100  # 0 -> backbone_lr ramp after unfreezing
     lr: float = 3e-4  # embeddings + depth decoder + MTP
     min_lr: float = 3e-5
-    backbone_lr: float = 1e-4  # gentler LR for 6 new NoPE Global GQA layers
+    backbone_lr: float = 1e-4  # gentler LR for the 6 new NoPE Global GQA layers
     min_backbone_lr: float = 1e-5
-    weight_decay: float = 0.01  # applied to 2D+ Linear weights only (norms, biases, embeddings excluded)
+    weight_decay: float = 0.01  # matrix weights only (norms, biases, embeddings excluded)
     grad_clip: float = 1.0
     seed: int = 42
     log_every: int = 10
@@ -50,37 +68,39 @@ class TrainConfig:
     sample_temp: float = 0.8
 
 
+# ----- schedule & optimizer --------------------------------------------------------------------
+
+
 def _cosine_lr(step: int, warmup: int, total: int, max_lr: float, min_lr: float) -> float:
     if step <= 0:
         return 0.0
     if step <= warmup:
         return max_lr * step / max(1, warmup)
-    progress = (step - warmup) / max(1, total - warmup)
-    progress = min(max(progress, 0.0), 1.0)
+    progress = min(max((step - warmup) / max(1, total - warmup), 0.0), 1.0)
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
 def _lrs_for_step(step: int, cfg: TrainConfig) -> tuple[float, float]:
-    """Return (head_lr, backbone_lr) with a separate gentle ramp for the 6 new Global GQA layers."""
+    """Return (head_lr, backbone_lr). The new layers stay at 0 until `warmup_freeze_steps`."""
     head_lr = _cosine_lr(step, cfg.lr_warmup_steps, cfg.max_steps, cfg.lr, cfg.min_lr)
     if step <= cfg.warmup_freeze_steps:
-        bb_lr = 0.0
-    else:
-        bb_step = step - cfg.warmup_freeze_steps
-        bb_total = max(1, cfg.max_steps - cfg.warmup_freeze_steps)
-        bb_lr = _cosine_lr(
-            bb_step, cfg.backbone_warmup_steps, bb_total, cfg.backbone_lr, cfg.min_backbone_lr
-        )
+        return head_lr, 0.0
+    bb_lr = _cosine_lr(
+        step - cfg.warmup_freeze_steps,
+        cfg.backbone_warmup_steps,
+        max(1, cfg.max_steps - cfg.warmup_freeze_steps),
+        cfg.backbone_lr,
+        cfg.min_backbone_lr,
+    )
     return head_lr, bb_lr
 
 
 def _collect_decay_split(module: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
-    """Split a module's parameters into (decay, no_decay), excluding norms, biases, and embeddings."""
+    """Split a module's parameters into (decay, no_decay): norms, biases and embeddings get no decay."""
     no_decay_ids: set[int] = set()
     for sub in module.modules():
         if isinstance(sub, (nn.Embedding, nn.LayerNorm, nn.RMSNorm)) or "norm" in type(sub).__name__.lower():
-            for p in sub.parameters(recurse=False):
-                no_decay_ids.add(id(p))
+            no_decay_ids.update(id(p) for p in sub.parameters(recurse=False))
 
     decay, no_decay = [], []
     seen: set[int] = set()
@@ -117,46 +137,84 @@ def build_optimizer(model: KazaModel, cfg: TrainConfig) -> tuple[torch.optim.Ada
         {"name": "bb_decay", "params": bb_decay, "lr": cfg.backbone_lr, "weight_decay": cfg.weight_decay},
         {"name": "bb_no_decay", "params": bb_no_decay, "lr": cfg.backbone_lr, "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
-    all_trainable = head_decay + head_no_decay + bb_decay + bb_no_decay
-    return optimizer, all_trainable
+    optimizer = torch.optim.AdamW(groups, betas=ADAM_BETAS)
+    return optimizer, head_decay + head_no_decay + bb_decay + bb_no_decay
+
+
+def _apply_config_hparams(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> None:
+    """Re-apply config hyperparameters after `optimizer.load_state_dict` restored the saved ones."""
+    for group in optimizer.param_groups:
+        group["weight_decay"] = cfg.weight_decay if group["name"] in DECAY_GROUPS else 0.0
+        group["betas"] = ADAM_BETAS
+
+
+# ----- checkpoints -----------------------------------------------------------------------------
+
+
+def _model_settings(model: KazaModel) -> dict:
+    return {
+        "drop_prob": model.embeddings.drop_prob,
+        "mtp_offsets": list(model.depth_decoder.mtp_offsets),
+        "mtp_weight": model.mtp_weight,
+        "nope_new_layers": model.backbone.nope_new_layers,
+    }
 
 
 def _save_checkpoint(
     path: Path,
     model: KazaModel,
-    optimizer: torch.optim.Optimizer,
     step: int,
     best_val_loss: float,
     cfg: TrainConfig,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
+    """Atomically save trainable weights (and optimizer state when given) to `path`."""
+    payload = {
+        "step": step,
+        "best_val_loss": best_val_loss,
+        "config": asdict(cfg),
+        "model_settings": _model_settings(model),
+        "model": model.trainable_state_dict(),
+    }
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
     tmp = path.with_suffix(".tmp")
-    torch.save(
-        {
-            "step": step,
-            "best_val_loss": best_val_loss,
-            "config": asdict(cfg),
-            "model": model.trainable_state_dict(),
-            "optimizer": optimizer.state_dict(),
-        },
-        tmp,
-    )
+    torch.save(payload, tmp)
     tmp.replace(path)
 
 
+def _check_resume_compat(ckpt: dict, model: KazaModel, cfg: TrainConfig) -> None:
+    """Raise if the checkpoint's model settings or schedule differ from the current run."""
+    problems = []
+    saved_model = ckpt.get("model_settings")
+    if saved_model is not None and saved_model != _model_settings(model):
+        problems.append(f"model settings: checkpoint={saved_model} current={_model_settings(model)}")
+    saved_cfg = ckpt.get("config", {})
+    current_cfg = asdict(cfg)
+    for key in RESUME_CRITICAL_FIELDS:
+        if key not in saved_cfg:
+            continue
+        saved = tuple(saved_cfg[key]) if isinstance(saved_cfg[key], list) else saved_cfg[key]
+        if saved != current_cfg[key]:
+            problems.append(f"{key}: checkpoint={saved} current={current_cfg[key]}")
+    if problems:
+        raise ValueError(
+            "Checkpoint does not match the current run. Use a new RUN_NAME or restore these settings:\n  "
+            + "\n  ".join(problems)
+        )
+
+
+# ----- evaluation & samples --------------------------------------------------------------------
+
+
 @torch.no_grad()
-def evaluate_val(
-    model: KazaModel,
-    val_loader: DataLoader,
-    max_batches: int = 16,
-) -> tuple[float, float]:
+def evaluate_val(model: KazaModel, val_loader: DataLoader, max_batches: int = 16) -> tuple[float, float]:
     """Held-out k=12 (all-masked) loss and accuracy."""
     losses, accs = [], []
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
-        batch = batch.to(model.device, non_blocking=True)
-        loss, acc = model.eval_all_masked(batch)
+        loss, acc = model.eval_all_masked(batch.to(model.device, non_blocking=True))
         losses.append(loss)
         accs.append(acc)
     if not losses:
@@ -170,131 +228,171 @@ def sample_continuation(
     codec: KazaCodec,
     val_tokens: torch.Tensor,
     out_dir: Path,
-    step: int,
+    name: str,
     prompt_frames: int = 25,
     gen_frames: int = 75,
     temperature: float = 0.8,
-    display_inline: bool = True,
 ) -> Path:
-    """Generate a free-running continuation from a held-out validation prompt."""
+    """Continue a held-out prompt free-running; save `samples/{name}.wav` and play it in notebooks."""
     samples_dir = out_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
     ref_tokens = val_tokens[: prompt_frames + gen_frames].unsqueeze(0).to(model.device).long()
-    prompt = ref_tokens[:, :prompt_frames]
-
-    ref_path = samples_dir / "val_reference.wav"
+    ref_path = samples_dir / f"val_reference_{prompt_frames}+{gen_frames}f.wav"
     if not ref_path.exists():
-        ref_wav = codec.decode(ref_tokens)[0].numpy()
-        sf.write(ref_path, ref_wav, SAMPLE_RATE)
+        sf.write(ref_path, codec.decode(ref_tokens)[0].numpy(), SAMPLE_RATE)
 
     gen_tokens = model.generate(
-        prompt,
+        ref_tokens[:, :prompt_frames],
         num_new_frames=gen_frames,
         num_passes=3,
         greedy=False,
         temperature=temperature,
     )
     gen_wav = codec.decode(gen_tokens)[0].numpy()
-    out_path = samples_dir / f"step_{step:06d}.wav"
+    out_path = samples_dir / f"{name}.wav"
     sf.write(out_path, gen_wav, SAMPLE_RATE)
 
-    if display_inline:
-        try:
-            from IPython.display import Audio, display
-
-            print(f"[Sample step {step}] 2s held-out prompt + 6s free-running continuation (temp={temperature}):")
-            display(Audio(gen_wav, rate=SAMPLE_RATE))
-        except Exception:
-            pass
+    try:
+        from IPython.display import Audio, display
+    except ImportError:
+        return out_path
+    print(
+        f"[Sample {name}] {prompt_frames / FRAME_RATE:.0f}s held-out prompt + "
+        f"{gen_frames / FRAME_RATE:.0f}s free-running continuation (temp={temperature}):"
+    )
+    display(Audio(gen_wav, rate=SAMPLE_RATE))
     return out_path
+
+
+# ----- streaming helpers -----------------------------------------------------------------------
+
+
+def _encode_exact(codec: KazaCodec, wav: torch.Tensor, frames: int) -> torch.Tensor:
+    """Encode `[B, frames * 1920]` audio and return exactly `frames` token frames."""
+    tokens = codec.encode(wav)
+    if tokens.shape[1] < frames:
+        raise RuntimeError(f"Codec returned {tokens.shape[1]} frames for {frames}-frame audio.")
+    return tokens[:, :frames]
+
+
+class _MicroBatchSlicer:
+    """Slices streamed max-length waveform batches into shorter micro-batches with no wasted audio."""
+
+    def __init__(self, batches: StreamBatcher, frame_lengths: tuple[int, ...]):
+        self.batches = batches
+        self.pending: dict[int, deque[torch.Tensor]] = {fl: deque() for fl in frame_lengths}
+
+    def next(self, frames: int) -> torch.Tensor:
+        q = self.pending[frames]
+        if not q:
+            try:
+                raw = next(self.batches)
+            except StopIteration:
+                raise RuntimeError("Training stream ended: every source was dropped (see [ALERT] lines).") from None
+            unit = frames * SAMPLES_PER_FRAME
+            q.extend(raw[:, s * unit : (s + 1) * unit] for s in range(raw.shape[1] // unit))
+        return q.popleft()
+
+
+# ----- preflight -------------------------------------------------------------------------------
 
 
 def preflight_check(
     model: KazaModel,
     codec: KazaCodec,
-    train_data: IterableDataset,
+    train_data: WaxalStreamingDataset,
     cfg: TrainConfig,
+    timed_batches: int = 5,
 ) -> dict[str, float]:
-    """Verify NoPE hook firing, 60s max-length micro-batch VRAM, and streaming throughput."""
-    # 1. Verify NoPE hook signature & firing on all 6 new layers
-    idx0 = model.backbone.new_layer_indices[0]
-    sig = inspect.signature(model.backbone.model.layers[idx0].forward)
-    has_pe = "position_embeddings" in sig.parameters
-    print(f"Layer {idx0} forward has `position_embeddings`: {has_pe}")
+    """Check NoPE hooks, steady-state streaming speed, and peak VRAM of one full max-length step.
 
-    # 2. Measure 1 full max-length (e.g. 750-frame = 60s) micro-batch: stream + encode + fwd/bwd
+    The VRAM figure includes AdamW state: one optimizer step runs with every LR and weight decay
+    set to 0, so no weight changes.
+    """
     max_frames = max(cfg.frame_lengths)
-    loader = DataLoader(
-        train_data,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
-    it = iter(loader)
-    _ = next(it)  # warm up worker startup & HF connection before timing
+    batches = StreamBatcher(train_data, cfg.batch_size, prefetch=cfg.prefetch_batches)
+    try:
+        t0 = time.perf_counter()
+        wav = next(batches)
+        t_first = time.perf_counter() - t0
 
-    if model.device.type == "cuda":
+        t1 = time.perf_counter()
+        for _ in range(timed_batches):
+            next(batches)
+        t_stream = (time.perf_counter() - t1) / timed_batches
+    finally:
+        batches.close()
+
+    on_cuda = model.device.type == "cuda"
+    if on_cuda:
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    t0 = time.perf_counter()
-    wav_batch = next(it)[:, : max_frames * SAMPLES_PER_FRAME]
-    t_stream = time.perf_counter() - t0
-
-    t1 = time.perf_counter()
-    tokens = codec.encode(wav_batch)[:, :max_frames]
-    if model.device.type == "cuda":
+    t2 = time.perf_counter()
+    tokens = _encode_exact(codec, wav[:, : max_frames * SAMPLES_PER_FRAME], max_frames)
+    if on_cuda:
         torch.cuda.synchronize()
-    t_codec = time.perf_counter() - t1
+    t_codec = time.perf_counter() - t2
+
+    optimizer, _ = build_optimizer(model, cfg)
+    for group in optimizer.param_groups:
+        group["lr"], group["weight_decay"] = 0.0, 0.0
 
     model.backbone.nope_hook_calls = 0
     model.train()
-    model.set_warmup(False)
-    t2 = time.perf_counter()
+    t3 = time.perf_counter()
     loss, _ = model.training_step(tokens)
     loss.backward()
-    model.zero_grad(set_to_none=True)
-    if model.device.type == "cuda":
+    optimizer.step()
+    if on_cuda:
         torch.cuda.synchronize()
-    t_train = time.perf_counter() - t2
-
+    t_train = time.perf_counter() - t3
     hooks_fired = model.backbone.nope_hook_calls
-    vram_gb = torch.cuda.max_memory_allocated() / (1024**3) if model.device.type == "cuda" else 0.0
-    audio_sec = cfg.batch_size * max_frames / FRAME_RATE
-    audio_per_sec = audio_sec / max(t_stream + t_codec + t_train, 1e-6)
+
+    vram_gb = torch.cuda.max_memory_allocated() / (1024**3) if on_cuda else 0.0
+    optimizer.zero_grad(set_to_none=True)
+    del optimizer
+    if on_cuda:
+        torch.cuda.empty_cache()
+
+    batch_audio_sec = cfg.batch_size * max_frames / FRAME_RATE
+    stream_rt = batch_audio_sec / max(t_stream, 1e-6)
+    gpu_rt = batch_audio_sec / max(t_codec + t_train, 1e-6)
+    expected_hooks = len(model.backbone.new_layer_indices) if model.backbone.nope_new_layers else 0
 
     print(
-        f"Preflight ({cfg.batch_size} x {max_frames} frames = {audio_sec:.0f}s audio):\n"
-        f"  NoPE hook calls: {hooks_fired} (expected {len(model.backbone.new_layer_indices) if model.backbone.nope_new_layers else 0})\n"
-        f"  Timing: stream={t_stream:.2f}s | codec={t_codec*1000:.1f}ms | fwd+bwd={t_train:.2f}s "
-        f"| {audio_per_sec:.1f} audio-sec/sec\n"
-        f"  Peak VRAM (max length {max_frames} frames): {vram_gb:.2f} GB"
+        f"Preflight ({cfg.batch_size} x {max_frames} frames = {batch_audio_sec:.0f}s audio):\n"
+        f"  NoPE hook calls: {hooks_fired} (expected {expected_hooks})\n"
+        f"  Stream: first batch {t_first:.1f}s | steady {t_stream:.2f}s/batch = {stream_rt:.0f}x real time\n"
+        f"  GPU: codec {t_codec * 1000:.0f}ms + fwd/bwd/step {t_train:.2f}s = {gpu_rt:.0f}x real time\n"
+        f"  Peak VRAM incl. AdamW state: {vram_gb:.2f} GB"
     )
-    if model.backbone.nope_new_layers and hooks_fired != len(model.backbone.new_layer_indices):
-        raise RuntimeError(
-            f"NoPE hook fired {hooks_fired} times, expected {len(model.backbone.new_layer_indices)}!"
-        )
-    return {"vram_gb": vram_gb, "codec_ms": t_codec * 1000, "audio_per_sec": audio_per_sec}
+    if hooks_fired != expected_hooks:
+        raise RuntimeError(f"NoPE hook fired {hooks_fired} times, expected {expected_hooks}.")
+    if stream_rt < gpu_rt:
+        print("  [WARN] Streaming is slower than the GPU step; training will wait on data.")
+    return {"vram_gb": vram_gb, "codec_ms": t_codec * 1000, "stream_rt": stream_rt, "gpu_rt": gpu_rt}
+
+
+# ----- training --------------------------------------------------------------------------------
 
 
 def train_phase1(
     model: KazaModel,
-    train_data: IterableDataset | torch.Tensor,
+    train_data: WaxalStreamingDataset,
     val_tokens: torch.Tensor,
     cfg: TrainConfig,
-    codec: KazaCodec | None = None,
+    codec: KazaCodec,
     resume: bool = True,
 ) -> list[dict]:
-    """Run Scaled Phase 1 training with exact frame-length sampling per step & Drive resume."""
+    """Run Phase 1 training with one frame length per optimizer step, Drive checkpoints and resume."""
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
     latest_ckpt = out_dir / "latest.pt"
     best_ckpt = out_dir / "best.pt"
-
-    is_streaming = isinstance(train_data, IterableDataset)
-    if is_streaming and codec is None:
-        raise ValueError("`codec` is required when `train_data` is a streaming waveform dataset.")
+    on_cuda = model.device.type == "cuda"
 
     optimizer, all_trainable = build_optimizer(model, cfg)
 
@@ -302,8 +400,10 @@ def train_phase1(
     best_val_loss = float("inf")
     if resume and latest_ckpt.exists():
         ckpt = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+        _check_resume_compat(ckpt, model, cfg)
         model.load_trainable_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        _apply_config_hparams(optimizer, cfg)
         start_step = int(ckpt["step"])
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
         print(f"Resumed from {latest_ckpt.name} at step {start_step} (best_val_k12_loss={best_val_loss:.4f})")
@@ -312,154 +412,132 @@ def train_phase1(
         print(f"Already reached max_steps ({cfg.max_steps}).")
         return []
 
-    # Reseed streaming dataset from start_step so resume never replays from clip 0
-    if is_streaming and hasattr(train_data, "seed"):
-        train_data.seed = cfg.seed + start_step * 31
-
-    max_frames = max(cfg.frame_lengths)
-    if is_streaming:
-        loader_kwargs = (
-            {"num_workers": cfg.num_workers, "prefetch_factor": 2, "persistent_workers": True}
-            if cfg.num_workers > 0
-            else {"num_workers": 0}
-        )
-        train_loader = DataLoader(train_data, batch_size=cfg.batch_size, drop_last=True, **loader_kwargs)
-    else:
-        train_ds = TokenChunkDataset(
-            train_data,
-            seq_len=max_frames,
-            random_offset=True,
-            steps_per_epoch=cfg.max_steps * cfg.batch_size * cfg.grad_accum,
-        )
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=True)
-
-    val_ds = TokenChunkDataset(val_tokens, seq_len=cfg.val_seq_len, random_offset=False)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
-    train_iter = iter(train_loader)
-
-    # Queue of sliced micro-batches so splitting 750-frame batches into 250/375 wastes zero audio
-    pending: dict[int, deque[torch.Tensor]] = {fl: deque() for fl in cfg.frame_lengths}
+    # New randomness per resume point: stream order, masks and slot drops
+    torch.manual_seed(cfg.seed + start_step)
+    train_data.seed = cfg.seed + start_step * 31
     step_rng = random.Random(cfg.seed + start_step)
 
-    def _next_microbatch(step_frames: int) -> torch.Tensor:
-        nonlocal train_iter
-        q = pending[step_frames]
-        if not q:
-            try:
-                raw = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                raw = next(train_iter)
-            unit = step_frames * SAMPLES_PER_FRAME if raw.ndim == 2 else step_frames
-            n_splits = max(1, raw.shape[1] // unit)
-            for s in range(n_splits):
-                q.append(raw[:, s * unit : (s + 1) * unit])
-        return q.popleft()
+    val_loader = DataLoader(
+        TokenChunkDataset(val_tokens, seq_len=cfg.val_seq_len), batch_size=cfg.batch_size, shuffle=False
+    )
+    batches = StreamBatcher(train_data, cfg.batch_size, prefetch=cfg.prefetch_batches)
+    slicer = _MicroBatchSlicer(batches, cfg.frame_lengths)
 
     model.train()
     model.set_warmup(start_step < cfg.warmup_freeze_steps)
     if start_step < cfg.warmup_freeze_steps:
         print(
-            f"Warmup active: embeddings + depth decoder frozen-backbone until step {cfg.warmup_freeze_steps} "
-            f"(then 6 new NoPE Global GQA layers ramp 0 -> {cfg.backbone_lr:.0e} over {cfg.backbone_warmup_steps} steps)"
+            f"Warmup: only embeddings + depth decoder train until step {cfg.warmup_freeze_steps}, "
+            f"then the 6 new NoPE layers ramp 0 -> {cfg.backbone_lr:.0e} over {cfg.backbone_warmup_steps} steps."
         )
 
     history: list[dict] = []
     t_log = time.perf_counter()
     frames_since_log = 0
+    completed_step = start_step
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
 
-    for step in range(start_step + 1, cfg.max_steps + 1):
-        if step == cfg.warmup_freeze_steps + 1:
-            model.set_warmup(False)
-            print(f"--- Step {step}: unfroze 6 new NoPE Global GQA layers (ramping 0 -> {cfg.backbone_lr:.0e}) ---")
+    try:
+        for step in range(start_step + 1, cfg.max_steps + 1):
+            if step == cfg.warmup_freeze_steps + 1:
+                model.set_warmup(False)
+                print(f"--- Step {step}: unfroze 6 new NoPE Global GQA layers ---")
 
-        head_lr, bb_lr = _lrs_for_step(step, cfg)
-        for group in optimizer.param_groups:
-            group["lr"] = head_lr if group["name"].startswith("head_") else bb_lr
+            head_lr, bb_lr = _lrs_for_step(step, cfg)
+            for group in optimizer.param_groups:
+                group["lr"] = head_lr if group["name"].startswith("head_") else bb_lr
 
-        # Pick ONE exact frame length for the entire optimizer step (equal grad_accum weights)
-        step_frames = step_rng.choice(cfg.frame_lengths)
+            step_frames = step_rng.choice(cfg.frame_lengths)  # one length per optimizer step
+            optimizer.zero_grad(set_to_none=True)
+            loss_audio_sum, loss_mtp_sum, acc_sum = 0.0, 0.0, 0.0
 
-        optimizer.zero_grad(set_to_none=True)
-        loss_audio_sum, loss_mtp_sum, acc_sum = 0.0, 0.0, 0.0
+            for _ in range(cfg.grad_accum):
+                tokens = _encode_exact(codec, slicer.next(step_frames), step_frames)
+                loss, acc = model.training_step(tokens)
+                (loss / cfg.grad_accum).backward()
 
-        for _ in range(cfg.grad_accum):
-            mb = _next_microbatch(step_frames)
-            if mb.ndim == 2:
-                tokens = codec.encode(mb)[:, :step_frames]
-            else:
-                tokens = mb.to(model.device, non_blocking=True)
+                loss_audio_sum += model.last_losses["audio"] / cfg.grad_accum
+                loss_mtp_sum += model.last_losses["mtp"] / cfg.grad_accum
+                acc_sum += acc.item() / cfg.grad_accum
+                frames_since_log += tokens.shape[0] * tokens.shape[1]
 
-            loss, acc = model.training_step(tokens)
-            (loss / cfg.grad_accum).backward()
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(all_trainable, cfg.grad_clip).item())
+            optimizer.step()
+            completed_step = step
 
-            loss_audio_sum += model.last_losses.get("audio", loss.item()) / cfg.grad_accum
-            loss_mtp_sum += model.last_losses.get("mtp", 0.0) / cfg.grad_accum
-            acc_sum += acc.item() / cfg.grad_accum
-            frames_since_log += tokens.shape[0] * tokens.shape[1]
+            record: dict = {
+                "step": step,
+                "frames": step_frames,
+                "lr": head_lr,
+                "bb_lr": bb_lr,
+                "loss_audio": round(loss_audio_sum, 4),
+                "loss_mtp": round(loss_mtp_sum, 4),
+                "acc": round(acc_sum, 4),
+                "grad_norm": round(grad_norm, 3),
+            }
 
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(all_trainable, cfg.grad_clip).item())
-        optimizer.step()
+            do_eval = step % cfg.eval_every == 0 or step == cfg.max_steps
+            if do_eval:
+                val_loss, val_acc = evaluate_val(model, val_loader, max_batches=cfg.eval_batches)
+                record["val_k12_loss"] = round(val_loss, 4)
+                record["val_k12_acc"] = round(val_acc, 4)
+                record["active_sources"] = train_data.active_sources
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint(best_ckpt, model, step, best_val_loss, cfg)  # weights only
 
-        record: dict = {
-            "step": step,
-            "frames": step_frames,
-            "lr": head_lr,
-            "bb_lr": bb_lr,
-            "loss_audio": round(loss_audio_sum, 4),
-            "loss_mtp": round(loss_mtp_sum, 4),
-            "acc": round(acc_sum, 4),
-            "grad_norm": round(grad_norm, 3),
-        }
+            if step % cfg.log_every == 0 or step == start_step + 1 or do_eval:
+                dt = max(time.perf_counter() - t_log, 1e-6)
+                rt = frames_since_log / FRAME_RATE / dt
+                vram = torch.cuda.max_memory_allocated() / (1024**3) if on_cuda else 0.0
+                record["audio_sec_per_sec"] = round(rt, 1)
+                record["vram_gb"] = round(vram, 2)
 
-        do_eval = (step % cfg.eval_every == 0) or (step == cfg.max_steps)
-        if do_eval:
-            val_loss, val_acc = evaluate_val(model, val_loader, max_batches=cfg.eval_batches)
-            record["val_k12_loss"] = round(val_loss, 4)
-            record["val_k12_acc"] = round(val_acc, 4)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                _save_checkpoint(best_ckpt, model, optimizer, step, best_val_loss, cfg)
+                val_str = (
+                    f" | val_k12={record['val_k12_loss']:.4f} ({record['val_k12_acc'] * 100:.1f}%)"
+                    f" | sources={record['active_sources']}"
+                    if do_eval
+                    else ""
+                )
+                print(
+                    f"step {step:4d}/{cfg.max_steps} ({step_frames}f) | audio={loss_audio_sum:.4f} "
+                    f"mtp={loss_mtp_sum:.4f} acc={acc_sum * 100:5.1f}%{val_str} "
+                    f"| lr={head_lr:.1e}/{bb_lr:.1e} gnorm={grad_norm:.2f} | {rt:.1f}x RT | {vram:.1f} GB"
+                )
+                with open(metrics_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+                history.append(record)
+                t_log = time.perf_counter()
+                frames_since_log = 0
+                if on_cuda:
+                    torch.cuda.reset_peak_memory_stats()
 
-        if step % cfg.log_every == 0 or step == start_step + 1 or do_eval:
-            dt = max(time.perf_counter() - t_log, 1e-6)
-            fps = frames_since_log / dt
-            vram = torch.cuda.max_memory_allocated() / (1024**3) if model.device.type == "cuda" else 0.0
-            record["frames_per_sec"] = round(fps, 1)
-            record["audio_sec_per_sec"] = round(fps / FRAME_RATE, 1)
-            record["vram_gb"] = round(vram, 2)
+            if step % cfg.save_every == 0 or step == cfg.max_steps:
+                _save_checkpoint(latest_ckpt, model, step, best_val_loss, cfg, optimizer=optimizer)
 
-            val_str = (
-                f" | val_k12={record['val_k12_loss']:.4f} ({record['val_k12_acc']*100:.1f}%)"
-                if "val_k12_loss" in record
-                else ""
-            )
-            print(
-                f"step {step:4d}/{cfg.max_steps} ({step_frames}f) | audio={loss_audio_sum:.4f} "
-                f"mtp={loss_mtp_sum:.4f} acc={acc_sum*100:5.1f}%{val_str} "
-                f"| lr={head_lr:.1e}/{bb_lr:.1e} gnorm={grad_norm:.2f} "
-                f"| {fps/FRAME_RATE:.1f}x RT | {vram:.1f} GB"
-            )
-            with open(metrics_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
-            history.append(record)
-            t_log = time.perf_counter()
-            frames_since_log = 0
-
-        if step % cfg.save_every == 0 or step == cfg.max_steps:
-            _save_checkpoint(latest_ckpt, model, optimizer, step, best_val_loss, cfg)
-
-        if codec is not None and (step % cfg.sample_every == 0 or step == cfg.max_steps):
-            sample_continuation(
-                model,
-                codec,
-                val_tokens,
-                out_dir=out_dir,
-                step=step,
-                prompt_frames=cfg.prompt_frames,
-                gen_frames=cfg.gen_frames,
-                temperature=cfg.sample_temp,
-            )
+            if step % cfg.sample_every == 0 or step == cfg.max_steps:
+                sample_continuation(
+                    model,
+                    codec,
+                    val_tokens,
+                    out_dir=out_dir,
+                    name=f"step_{step:06d}",
+                    prompt_frames=cfg.prompt_frames,
+                    gen_frames=cfg.gen_frames,
+                    temperature=cfg.sample_temp,
+                )
+    except BaseException:
+        # On a crash or manual interrupt, keep the last completed step unless it was just saved
+        if completed_step > start_step and completed_step % cfg.save_every != 0:
+            try:
+                _save_checkpoint(latest_ckpt, model, completed_step, best_val_loss, cfg, optimizer=optimizer)
+                print(f"Saved {latest_ckpt.name} at step {completed_step} before stopping.")
+            except Exception as save_err:
+                print(f"[WARN] Could not save {latest_ckpt.name}: {save_err}")
+        raise
+    finally:
+        batches.close()
 
     return history
 
@@ -473,9 +551,16 @@ def plot_metrics(out_dir: str | Path) -> None:
         print(f"No metrics file found at {path}")
         return
 
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Keep the last record per step: a resume can log the same step twice
+    by_step: dict[int, dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            r = json.loads(line)
+            by_step[r["step"]] = r
+    rows = [by_step[s] for s in sorted(by_step)]
     steps = [r["step"] for r in rows]
     val_rows = [r for r in rows if "val_k12_loss" in r]
+    val_steps = [r["step"] for r in val_rows]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -483,12 +568,7 @@ def plot_metrics(out_dir: str | Path) -> None:
     if any(r.get("loss_mtp", 0) > 0 for r in rows):
         ax1.plot(steps, [r["loss_mtp"] for r in rows], label="Train MTP (t+2, t+4)", alpha=0.7)
     if val_rows:
-        ax1.plot(
-            [r["step"] for r in val_rows],
-            [r["val_k12_loss"] for r in val_rows],
-            "o-",
-            label="Val k=12 loss",
-        )
+        ax1.plot(val_steps, [r["val_k12_loss"] for r in val_rows], "o-", label="Val k=12 loss")
     ax1.set_title("Loss")
     ax1.set_xlabel("Step")
     ax1.legend()
@@ -496,12 +576,7 @@ def plot_metrics(out_dir: str | Path) -> None:
 
     ax2.plot(steps, [r["acc"] * 100 for r in rows], label="Train masked acc (%)")
     if val_rows:
-        ax2.plot(
-            [r["step"] for r in val_rows],
-            [r["val_k12_acc"] * 100 for r in val_rows],
-            "o-",
-            label="Val k=12 acc (%)",
-        )
+        ax2.plot(val_steps, [r["val_k12_acc"] * 100 for r in val_rows], "o-", label="Val k=12 acc (%)")
     ax2.set_title("Accuracy (%)")
     ax2.set_xlabel("Step")
     ax2.legend()

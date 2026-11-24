@@ -58,11 +58,8 @@ class StreamEmbedding(nn.Module):
         for i, table in enumerate(self.tables):
             ids = tokens[:, :, i]
             is_zero = ids == ZERO_TOKEN_ID
-            safe_ids = ids.masked_fill(is_zero, 0)
-            emb = table(safe_ids)
-            if is_zero.any():
-                emb = emb.masked_fill(is_zero.unsqueeze(-1), 0.0)
-            out = out + emb
+            emb = table(ids.masked_fill(is_zero, 0))
+            out = out + emb.masked_fill(is_zero.unsqueeze(-1), 0.0)
         return out
 
 
