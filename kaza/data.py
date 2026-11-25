@@ -169,8 +169,8 @@ class WaxalStreamingDataset(IterableDataset):
         source_weights: list[float] | None = None,
         clip_frames: int = 750,
         gap_sec: float = 0.3,
-        max_speakers: int = 16,
-        max_buffer_mb: float = 1024.0,
+        max_speakers: int = 8, #16,
+        max_buffer_mb: float = 256.0, #1024.0,
         seed: int = 42,
         max_retries: int = 5,
     ):
