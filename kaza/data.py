@@ -21,7 +21,7 @@ Source = tuple[str, str, str]  # (dataset_id, config, split)
 
 MIN_UTTERANCE_SEC = 0.4  # skip ultra-short artifacts
 GAP_NOISE_STD = 1e-4  # low-level room tone between packed utterances
-SHUFFLE_BUFFER_ROWS = 200  # HF streaming shuffle buffer per open source
+SHUFFLE_BUFFER_ROWS = 16 #200  # HF streaming shuffle buffer per open source
 MAX_BACKOFF_SEC = 16
 EPOCH_SEED_STRIDE = 1009
 MAX_CONSECUTIVE_DECODE_FAILURES = 500
