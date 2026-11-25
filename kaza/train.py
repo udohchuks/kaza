@@ -413,6 +413,7 @@ def train_phase1(
                 loss_mtp_sum += model.last_losses["mtp"] / cfg.grad_accum
                 acc_sum += acc.item() / cfg.grad_accum
                 frames_since_log += tokens.shape[0] * tokens.shape[1]
+                del wav_batch, tokens, loss, acc
 
             if step == start_step + 1 and model.backbone.nope_new_layers:
                 expected_hooks = len(model.backbone.new_layer_indices) * cfg.grad_accum
