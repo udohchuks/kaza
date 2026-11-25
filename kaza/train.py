@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import random
@@ -46,7 +47,7 @@ class TrainConfig:
     val_seq_len: int = 375  # 30.0s fixed validation windows
     batch_size: int = 4  # A100-40GB: 4 (safe up to 60s) | A100-80GB: 8 | L4: 2
     grad_accum: int = 8  # effective batch = 32 clips
-    prefetch_batches: int = 4  # streamed batches kept ready by the background thread
+    prefetch_batches: int = 2  # streamed batches kept ready by the background thread
     max_steps: int = 5000
     warmup_freeze_steps: int = 200  # embeddings + depth decoder only before unfreezing 6 new layers
     lr_warmup_steps: int = 100
@@ -160,6 +161,32 @@ def _model_settings(model: KazaModel) -> dict:
     }
 
 
+def _cpu_optimizer_state_dict(optimizer: torch.optim.Optimizer) -> dict:
+    """Build an optimizer state_dict on CPU without duplicating all state tensors on GPU."""
+    param_to_idx: dict[nn.Parameter, int] = {}
+    groups = []
+    idx = 0
+    for g in optimizer.param_groups:
+        packed = {k: v for k, v in g.items() if k != "params"}
+        pids = []
+        for p in g["params"]:
+            param_to_idx[p] = idx
+            pids.append(idx)
+            idx += 1
+        packed["params"] = pids
+        groups.append(packed)
+
+    state = {}
+    for p, st in optimizer.state.items():
+        if p not in param_to_idx:
+            continue
+        state[param_to_idx[p]] = {
+            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in st.items()
+        }
+    return {"state": state, "param_groups": groups}
+
+
 def _save_checkpoint(
     path: Path,
     model: KazaModel,
@@ -177,10 +204,12 @@ def _save_checkpoint(
         "model": model.trainable_state_dict(),
     }
     if optimizer is not None:
-        payload["optimizer"] = optimizer.state_dict()
+        payload["optimizer"] = _cpu_optimizer_state_dict(optimizer)
     tmp = path.with_suffix(".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)
+    del payload
+    gc.collect()
 
 
 def _check_resume_compat(ckpt: dict, model: KazaModel, cfg: TrainConfig) -> None:
@@ -269,8 +298,12 @@ def sample_continuation(
 
 
 def _encode_exact(codec: KazaCodec, wav: torch.Tensor, frames: int) -> torch.Tensor:
-    """Encode `[B, frames * 1920]` audio and return exactly `frames` token frames."""
-    tokens = codec.encode(wav)
+    """Encode `[B, frames * 1920]` audio clip-by-clip and return exactly `frames` token frames."""
+    if wav.ndim == 2 and wav.shape[0] > 1:
+        parts = [codec.encode(wav[i]) for i in range(wav.shape[0])]
+        tokens = torch.cat(parts, dim=0)
+    else:
+        tokens = codec.encode(wav)
     if tokens.shape[1] < frames:
         raise RuntimeError(f"Codec returned {tokens.shape[1]} frames for {frames}-frame audio.")
     return tokens[:, :frames]
@@ -308,6 +341,17 @@ def _open_tb_writer(log_dir: Path):
         return None
 
 
+def _process_ram_gb() -> float:
+    """Return current process RSS in GB on Linux/Colab (0.0 if unavailable)."""
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / (1024**2)
+    except OSError:
+        pass
+    return 0.0
+
+
 def _log_tb(writer, record: dict, step: int) -> None:
     if writer is None:
         return
@@ -320,6 +364,8 @@ def _log_tb(writer, record: dict, step: int) -> None:
     writer.add_scalar("health/grad_norm", record["grad_norm"], step)
     writer.add_scalar("perf/audio_x_rt", record["audio_sec_per_sec"], step)
     writer.add_scalar("perf/vram_gb", record["vram_gb"], step)
+    if record.get("ram_gb", 0.0) > 0.0:
+        writer.add_scalar("perf/ram_gb", record["ram_gb"], step)
     if "val_k12_loss" in record:
         writer.add_scalar("loss/val_k12", record["val_k12_loss"], step)
         writer.add_scalar("acc/val_k12", record["val_k12_acc"] * 100.0, step)
@@ -452,8 +498,11 @@ def train_phase1(
                 dt = max(time.perf_counter() - t_log, 1e-6)
                 rt = frames_since_log / FRAME_RATE / dt
                 vram = torch.cuda.max_memory_allocated() / (1024**3) if on_cuda else 0.0
+                ram = _process_ram_gb()
                 record["audio_sec_per_sec"] = round(rt, 1)
                 record["vram_gb"] = round(vram, 2)
+                if ram > 0.0:
+                    record["ram_gb"] = round(ram, 2)
 
                 val_str = (
                     f" | val_k12={record['val_k12_loss']:.4f} ({record['val_k12_acc'] * 100:.1f}%)"
@@ -461,10 +510,11 @@ def train_phase1(
                     if do_eval
                     else ""
                 )
+                ram_str = f" / {ram:.1f} GB RAM" if ram > 0.0 else ""
                 print(
                     f"step {step:4d}/{cfg.max_steps} ({step_frames}f) | audio={loss_audio_sum:.4f} "
                     f"mtp={loss_mtp_sum:.4f} acc={acc_sum * 100:5.1f}%{val_str} "
-                    f"| lr={head_lr:.1e}/{bb_lr:.1e} gnorm={grad_norm:.2f} | {rt:.1f}x RT | {vram:.1f} GB"
+                    f"| lr={head_lr:.1e}/{bb_lr:.1e} gnorm={grad_norm:.2f} | {rt:.1f}x RT | {vram:.1f} GB VRAM{ram_str}"
                 )
                 with open(metrics_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record) + "\n")

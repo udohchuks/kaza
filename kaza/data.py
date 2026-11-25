@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import io
 import queue
 import random
@@ -21,11 +22,24 @@ Source = tuple[str, str, str]  # (dataset_id, config, split)
 
 MIN_UTTERANCE_SEC = 0.4  # skip ultra-short artifacts
 GAP_NOISE_STD = 1e-4  # low-level room tone between packed utterances
-SHUFFLE_BUFFER_ROWS = 16 #200  # HF streaming shuffle buffer per open source
+SHUFFLE_BUFFER_ROWS = 16  # HF streaming shuffle buffer per open source (kept small to bound RAM)
+MAX_OPEN_SOURCES = 6  # max simultaneous open HF Parquet streams (prevents PyArrow/shuffle RAM OOM)
+CLIPS_PER_SOURCE_VISIT = 16  # clips drawn from an active slot before rotating to a new source
 MAX_BACKOFF_SEC = 16
 EPOCH_SEED_STRIDE = 1009
 MAX_CONSECUTIVE_DECODE_FAILURES = 500
 BYTES_PER_SAMPLE = 4  # float32
+
+
+def _release_ram() -> None:
+    """Reclaim Python objects and PyArrow's Parquet memory pool back to the OS."""
+    gc.collect()
+    try:
+        import pyarrow as pa
+
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
 
 
 def _language_of(config: str) -> str:
@@ -169,8 +183,11 @@ class WaxalStreamingDataset(IterableDataset):
         source_weights: list[float] | None = None,
         clip_frames: int = 750,
         gap_sec: float = 0.3,
-        max_speakers: int = 8, #16,
-        max_buffer_mb: float = 256.0, #1024.0,
+        max_speakers: int = 8,
+        max_buffer_mb: float = 256.0,
+        max_open_sources: int = MAX_OPEN_SOURCES,
+        clips_per_visit: int = CLIPS_PER_SOURCE_VISIT,
+        shuffle_buffer_rows: int = SHUFFLE_BUFFER_ROWS,
         seed: int = 42,
         max_retries: int = 5,
     ):
@@ -187,6 +204,9 @@ class WaxalStreamingDataset(IterableDataset):
         self.gap_samples = int(round(gap_sec * SAMPLE_RATE))
         self.max_speakers = max_speakers
         self.max_buffer_samples = int(max_buffer_mb * 1024 * 1024) // BYTES_PER_SAMPLE
+        self.max_open_sources = max(1, int(max_open_sources))
+        self.clips_per_visit = max(1, int(clips_per_visit))
+        self.shuffle_buffer_rows = max(1, int(shuffle_buffer_rows))
         self.seed = seed
         self.max_retries = max_retries
         self.active_sources = len(self.sources)
@@ -245,7 +265,7 @@ class WaxalStreamingDataset(IterableDataset):
 
         ds = load_dataset(dataset_id, config, split=split, streaming=True)
         ds = ds.cast_column("audio", Audio(decode=False))
-        ds = ds.shuffle(seed=epoch_seed, buffer_size=SHUFFLE_BUFFER_ROWS)
+        ds = ds.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_rows)
         return iter(ds)
 
     def _new_state(self, source: Source, weight: float) -> dict:
@@ -366,20 +386,63 @@ class WaxalStreamingDataset(IterableDataset):
         states = [self._new_state(src, w) for src, w in zip(self.sources, self.source_weights)]
         initial_count = len(states)
         self.active_sources = initial_count
+        slots: list[dict] = []
 
-        while states:
-            idx = rng.choices(range(len(states)), weights=[s["weight"] for s in states], k=1)[0]
-            clip = self._next_clip_from_source(states[idx], states)
-            if clip is None:
-                dropped = states.pop(idx)
-                self.active_sources = len(states)
-                print(
-                    f"[ALERT] Dropped {dropped['config']}/{dropped['split']} "
-                    f"({dropped['decode_fail_total']} decode failures) "
-                    f"- {len(states)}/{initial_count} sources remain."
-                )
-                continue
-            yield clip
+        def _drop_state(state: dict) -> None:
+            nonlocal slots
+            state["iter"] = None
+            state["spk_bufs"].clear()
+            state["spk_samples"] = 0
+            state["mixed_buf"].clear()
+            state["mixed_len"] = 0
+            if state in states:
+                states.remove(state)
+            slots = [sl for sl in slots if sl["state"] is not state]
+            self.active_sources = len(states)
+            _release_ram()
+            print(
+                f"[ALERT] Dropped {state['config']}/{state['split']} "
+                f"({state['decode_fail_total']} decode failures) "
+                f"- {len(states)}/{initial_count} sources remain."
+            )
+
+        def _close_if_unused(state: dict) -> None:
+            if state["iter"] is not None and not any(sl["state"] is state for sl in slots):
+                state["iter"] = None
+                _release_ram()
+
+        try:
+            while states:
+                if len(states) <= self.max_open_sources:
+                    state = rng.choices(states, weights=[s["weight"] for s in states], k=1)[0]
+                    clip = self._next_clip_from_source(state, states)
+                    if clip is None:
+                        _drop_state(state)
+                        continue
+                    yield clip
+                    continue
+
+                while len(slots) < min(self.max_open_sources, len(states)):
+                    chosen = rng.choices(states, weights=[s["weight"] for s in states], k=1)[0]
+                    slots.append({"state": chosen, "remaining": self.clips_per_visit})
+
+                slot_idx = rng.randrange(len(slots))
+                slot = slots[slot_idx]
+                state = slot["state"]
+                clip = self._next_clip_from_source(state, states)
+                if clip is None:
+                    _drop_state(state)
+                    continue
+
+                slot["remaining"] -= 1
+                if slot["remaining"] <= 0:
+                    slots.pop(slot_idx)
+                    _close_if_unused(state)
+                yield clip
+        finally:
+            for s in states:
+                s["iter"] = None
+            _release_ram()
 
 
 class StreamBatcher:
@@ -523,6 +586,8 @@ def build_token_cache(
         if src_samples < per_source_cap:
             print(f"  [WARN] {config}/{split} gave {src_samples / SAMPLE_RATE:.0f}s of a {per_source_cap / SAMPLE_RATE:.0f}s budget.")
         _flush()
+        ds = None
+        _release_ram()
 
     if not token_chunks:
         raise RuntimeError(f"No audio encoded from sources: {sources}")
